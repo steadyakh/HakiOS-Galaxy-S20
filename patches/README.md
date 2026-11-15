@@ -1,7 +1,7 @@
 # The S20's changes to HakiOS, by area
 
 Each folder is one area of the port, as a patch against HakiOS at the commit in [UPSTREAM_BASE](UPSTREAM_BASE)
-(HakiOS 2.3.4). Apply them in order (01 to 09); together they are every S20 change outside `devices/x1s/`.
+(HakiOS 2.3.4). Apply them in order (01 to 10); together they are every S20 change outside `devices/x1s/`.
 
 ```sh
 for p in ../HakiOS-Galaxy-S20/patches/*/*.patch; do git apply "$p"; done
@@ -23,3 +23,7 @@ parts are named below.
 | [09-build-ci-tools](09-build-ci-tools) | GitHub Actions for the kernel, Mesa and U-Boot, `xl` (the phone tool) for the S20 | 7 |
 
 The S20's U-Boot (menu, UFS driver, device tree) is not a patch to HakiOS: it is in `devices/x1s/u-boot/`.
+
+## Mesa retention trial (10)
+
+Adds the MIT-licensed z3sios buffer-cache patch to tools/mesa. Read in the source: 30-second retention with a 64 MiB budget. Not built or measured on this phone yet; keep only after a three-run comparison. See ../CREDITS.md.

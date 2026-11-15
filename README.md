@@ -85,3 +85,15 @@ Linux's and Samsung's open-source Exynos 990 kernel sources (read for register f
 
 Files here keep the licenses of the HakiOS files they come from or change (see HakiOS's `LICENSE`, `LICENSE.APSL`,
 `THIRD_PARTY_LICENSES.md`); U-Boot parts are GPL-2.0+. See [LEGAL.md](LEGAL.md).
+
+## Public Mesa build
+
+The **x1s mesa** workflow checks out the exact HakiOS commit in `patches/UPSTREAM_BASE`,
+applies `patches/*/*.patch` in lexical order, and builds Mesa 25.0.7 with `softpipe,panfrost`
+and our GL userland. A matching push to main starts one build; manual dispatch is also available.
+The iPhoneOS SDK is downloaded only on the disposable runner, never committed or uploaded.
+
+The `x1s-userland-gl` artifact contains only explicitly listed ARM64 programs/libraries built
+from source, licence notices, source provenance and checksums. No SDK, Apple/Samsung system files,
+firmware, device trees, boot images or APFS images are uploaded. Image assembly stays on the owner's PC.
+The retention patch is an experiment: **read in the source; not built or measured on the phone yet**.

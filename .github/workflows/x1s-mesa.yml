@@ -1,0 +1,96 @@
+# Public source-only build. SDKs stay on the ephemeral Linux runner.
+name: x1s mesa
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'patches/**'
+      - '.github/workflows/x1s-mesa.yml'
+      - 'tools/package-mesa.py'
+      - 'CREDITS.md'
+permissions:
+  contents: read
+concurrency:
+  group: x1s-mesa-${{ github.ref }}
+  cancel-in-progress: false
+env:
+  THEOS: /home/runner/theos
+  DRIVERS: softpipe,panfrost
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: bash
+        working-directory: hakios
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: port
+          persist-credentials: false
+      - name: Read pinned upstream
+        id: upstream
+        working-directory: port
+        run: |
+          base=$(tr -d '\r\n' < patches/UPSTREAM_BASE)
+          [[ "$base" =~ ^[0-9a-f]{40}$ ]]
+          echo "sha=$base" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v4
+        with:
+          repository: oosexgang/hakios-xnu-kernel
+          ref: ${{ steps.upstream.outputs.sha }}
+          path: hakios
+          persist-credentials: false
+      - name: Apply the public patches in order
+        run: |
+          export LC_ALL=C
+          for p in ../port/patches/*/*.patch; do
+            echo "Applying $p"
+            git apply --check "$p"
+            git apply "$p"
+          done
+          test -f tools/mesa/panfrost-retain.patch
+      - name: Packages
+        timeout-minutes: 20
+        run: |
+          apt_opts="-o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -o Acquire::Retries=3"
+          for try in 1 2 3; do sudo timeout 300 apt-get $apt_opts update && break; done
+          for try in 1 2 3; do
+            sudo timeout 600 apt-get $apt_opts install -y git curl tar xz-utils make build-essential clang lld llvm \
+              flex bison m4 perl python3 python3-venv autoconf automake libtool uuid-dev libssl-dev cpio \
+              meson ninja-build && break
+          done
+
+      - name: theos's Linux iOS toolchain and the iPhoneOS 16.5 SDK
+        run: |
+          mkdir -p "$THEOS/toolchain" "$THEOS/sdks"
+          curl -fsSL --retry 3 https://github.com/L1ghtmann/llvm-project/releases/latest/download/iOSToolchain-x86_64.tar.xz \
+            | tar -xJ -C "$THEOS/toolchain"
+          test -x "$THEOS/toolchain/linux/iphone/bin/ld"
+          git clone -q --depth 1 --filter=blob:none --sparse https://github.com/theos/sdks.git "$THEOS/sdks-git"
+          git -C "$THEOS/sdks-git" sparse-checkout set iPhoneOS16.5.sdk
+          ln -s ../sdks-git/iPhoneOS16.5.sdk "$THEOS/sdks/iPhoneOS16.5.sdk"
+
+      - name: The kernel's compiler wrapper (xnu-deps stage 1)
+        run: |
+          set -o pipefail
+          mkdir -p logs
+          xnu-deps/setup.sh --stage1 > logs/xnu-deps.log 2>&1 || { tail -n 60 logs/xnu-deps.log; exit 1; }
+          ls -la xnu-deps/host/bin/xnu-clang
+
+      - name: Mesa and our GL userland (no system images)
+        run: |
+          set -o pipefail
+          DRIVERS=softpipe,panfrost tools/mk-mesa.sh 2>&1 | tee logs/mesa-build.log | tail -n 30
+          mkdir -p sysimage/rootfs/usr/lib
+          GL=1 COMPILE_ONLY=1 userland/build.sh 2>&1 | tee logs/userland-gl-build.log | tail -n 30
+      - name: Package only explicitly listed outputs
+        run: python3 ../port/tools/package-mesa.py . ../port ../out-userland-gl
+      - uses: actions/upload-artifact@v4
+        with:
+          name: x1s-userland-gl
+          path: out-userland-gl/
+          retention-days: 14
+          if-no-files-found: error
