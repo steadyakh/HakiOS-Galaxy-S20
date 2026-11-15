@@ -58,9 +58,9 @@ Details, numbers and every test run are in [docs/PLAN.md](docs/PLAN.md).
 
 ```sh
 git clone https://github.com/oosexgang/hakios-xnu-kernel hakios && cd hakios
-git checkout $(cat ../HakiOS-S20/patches/UPSTREAM_BASE)
-git apply ../HakiOS-S20/patches/hakios-2.3.4-s20.patch
-cp -r ../HakiOS-S20/devices/x1s devices/
+git checkout $(cat ../HakiOS-Galaxy-S20/patches/UPSTREAM_BASE)
+git apply ../HakiOS-Galaxy-S20/patches/hakios-2.3.4-s20.patch
+cp -r ../HakiOS-Galaxy-S20/devices/x1s devices/
 ```
 
 Then follow `docs/PLAN.md` (kernel and Mesa build on Linux/CI, images on Windows or Linux from your own IPSW,
