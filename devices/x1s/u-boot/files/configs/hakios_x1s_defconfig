@@ -1,0 +1,84 @@
+# HakiOS's U-Boot for the Samsung Galaxy S20 5G (x1s, SM-G981B, Exynos 990).
+# Mainline U-Boot's generic board for Samsung Exynos phones (exynos-mobile: S-BOOT starts it as the kernel of boot.img),
+# with the x1s device tree, the hakios command that starts the HakiOS loader from memory (cmd/hakios.c), and the
+# changes of devices/x1s/u-boot/x1s.patch (S-BOOT's RAM banks, the screen's refresh, the heat guard, Exynos990 USB).
+#include "exynos-mobile_defconfig"
+
+CONFIG_DEFAULT_DEVICE_TREE="exynos/exynos990-x1s-hakios"
+CONFIG_ENV_SOURCE_FILE="hakios-x1s"
+# S-BOOT reports the RAM in more pieces than the Exynos 7870 phones' three
+CONFIG_NR_DRAM_BANKS=8
+
+# the HakiOS loader and its payload from memory; on x1s the payload lives at 0xC8000000 (0xF0000000 is the modem's
+# and the framebuffer's here): the x1s platform of xnuloader/loader.c and the device tree's hakios-payload say the same
+CONFIG_CMD_HAKIOS=y
+CONFIG_HAKIOS_PAYLOAD_BASE=0xC8000000
+# the HakiOS loader talks fastboot to the host itself, through Qualcomm's USB device protocol (xl)
+CONFIG_EFI_QCOM_USB_DEVICE=y
+
+# the heat guard (board/samsung/exynos-mobile/exynos-mobile.c): a cyclic function powers the phone off after
+# hakios_max_minutes
+CONFIG_CYCLIC=y
+
+# a console a person can read on a 1440x3200 panel
+# CONFIG_VIDEO_FONT_8X16 is not set
+CONFIG_VIDEO_FONT_16X32=y
+
+# the panic stays on the screen; fastboot takes a whole HKUB container and gives U-Boot's log and shell to the host
+CONFIG_PANIC_HANG=y
+CONFIG_CMD_PAUSE=y
+CONFIG_FASTBOOT_BUF_SIZE=0x8000000
+CONFIG_FASTBOOT_OEM_RUN=y
+CONFIG_CONSOLE_RECORD=y
+CONFIG_CONSOLE_RECORD_INIT_F=y
+CONFIG_CONSOLE_RECORD_OUT_SIZE=0x6000
+CONFIG_FASTBOOT_CMD_OEM_CONSOLE=y
+# CONFIG_REQUIRE_SERIAL_CONSOLE is not set
+
+# The HakiOS loader keeps U-Boot's boot services while the kernel runs: no watchdog of U-Boot's.
+# CONFIG_WATCHDOG_AUTOSTART is not set
+
+# Nothing on the phone's storage is ever written by this U-Boot, and nothing touches the power chip (PMIC):
+# no flashing over fastboot, no DFU, no capsule updates, no PMIC or regulator drivers.
+# CONFIG_FASTBOOT_FLASH is not set
+# CONFIG_DFU_MMC is not set
+# CONFIG_EFI_RUNTIME_UPDATE_CAPSULE is not set
+# CONFIG_EFI_CAPSULE_ON_DISK is not set
+# CONFIG_EFI_CAPSULE_FIRMWARE_RAW is not set
+# CONFIG_TOOLS_MKEFICAPSULE is not set
+# CONFIG_DM_REGULATOR_S2MPS11 is not set
+# CONFIG_PMIC_S2MPS11 is not set
+# CONFIG_DM_PMIC is not set
+
+# the keys (gpio-keys: power, volume up and down) through the Exynos990 pin controller; the menu is driven with them
+CONFIG_PINCTRL_EXYNOS990=y
+# CONFIG_PINCTRL_EXYNOS78x0 is not set
+# the poweroff command is the board's (PSCI SYSTEM_OFF through SMC); the system controller only restarts
+# CONFIG_SYSRESET_CMD_POWEROFF is not set
+
+# Boot progress and faults painted into the framebuffer until the console is up (board/samsung/exynos-mobile): the first
+# test showed nothing after S-BOOT's "Starting kernel...". The virtual counter, as Linux reads it at EL1 below a hypervisor.
+CONFIG_EXYNOS_MOBILE_FB_MARKERS=y
+# the stage bars and squares: off now that U-Boot starts; =y to see where a start stops
+# CONFIG_EXYNOS_MOBILE_FB_PROGRESS is not set
+CONFIG_ARMV8_TIMER_VIRTUAL_COUNTER=y
+
+# back to the menu after a menu item ends at the prompt (hakios-x1s.env: bootretry)
+CONFIG_BOOT_RETRY=y
+CONFIG_BOOT_RETRY_TIME=1
+CONFIG_RETRY_BOOTCMD=y
+
+# U-Boot's fastboot as Google's fastboot device (18d1:4ee0), as upstream's U-Boot on the POCO X5 Pro: Windows takes it
+# with WinUSB (U-Boot sends Microsoft's OS descriptors), and Samsung's PC drivers do not claim it as a phone modem
+CONFIG_USB_GADGET_MANUFACTURER="Google"
+CONFIG_USB_GADGET_VENDOR_NUM=0x18d1
+CONFIG_USB_GADGET_PRODUCT_NUM=0x4ee0
+
+# The phone's storage, READ ONLY (board/samsung/exynos-mobile/x1s-ufs.c, PLAN.md "iOS from the phone's own storage" S2):
+# a SCSI host that takes S-BOOT's running UFS controller as it is; U-Boot's block layer, its GPT reader and UEFI's
+# block I/O (for the HakiOS loader) on top. "part" and "scsi" to look at it; SHA-256 to check images against it.
+CONFIG_SCSI=y
+CONFIG_CMD_SCSI=y
+CONFIG_CMD_PART=y
+CONFIG_CMD_HASH=y
+CONFIG_SHA256=y

@@ -1,0 +1,4 @@
+# HakiOS defconfig for the Galaxy S20 5G (SM-G981B) (x1s): the common kernel, the exynos990 family's facts, and this device's own.
+#include common_defconfig
+#include exynos990.config
+#include x1s.config

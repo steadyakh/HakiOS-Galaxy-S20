@@ -1,0 +1,2678 @@
+diff --git a/arch/arm/cpu/armv8/Kconfig b/arch/arm/cpu/armv8/Kconfig
+index dfc4ce85..1e580b01 100644
+--- a/arch/arm/cpu/armv8/Kconfig
++++ b/arch/arm/cpu/armv8/Kconfig
+@@ -4,6 +4,14 @@ config CMO_BY_VA_ONLY
+ 	bool "Force cache maintenance to be exclusively by VA"
+ 	depends on !SYS_DISABLE_DCACHE_OPS
+ 
++config ARMV8_TIMER_VIRTUAL_COUNTER
++	bool "Read the generic timer's virtual counter (CNTVCT_EL0)"
++	help
++	  Read time from the virtual counter instead of the physical one, as
++	  Linux does at EL1. For boards started at EL1 below a hypervisor that
++	  may trap EL1's access to the physical counter (Samsung's H-Arx on
++	  the Exynos990 phones).
++
+ config ARMV8_CNTFRQ_BROKEN
+ 	bool "Fix broken ARMv8 generic timer"
+ 	depends on SYS_ARCH_TIMER
+diff --git a/arch/arm/cpu/armv8/generic_timer.c b/arch/arm/cpu/armv8/generic_timer.c
+index 744ab3b9..dc63d5d5 100644
+--- a/arch/arm/cpu/armv8/generic_timer.c
++++ b/arch/arm/cpu/armv8/generic_timer.c
+@@ -86,7 +86,11 @@ unsigned long notrace timer_read_counter(void)
+ 	unsigned long cntpct;
+ 
+ 	isb();
++#ifdef CONFIG_ARMV8_TIMER_VIRTUAL_COUNTER
++	asm volatile("mrs %0, cntvct_el0" : "=r" (cntpct));
++#else
+ 	asm volatile("mrs %0, cntpct_el0" : "=r" (cntpct));
++#endif
+ 
+ 	return cntpct;
+ }
+diff --git a/arch/arm/lib/interrupts_64.c b/arch/arm/lib/interrupts_64.c
+index b3024ba5..771b0685 100644
+--- a/arch/arm/lib/interrupts_64.c
++++ b/arch/arm/lib/interrupts_64.c
+@@ -31,6 +31,14 @@ int disable_interrupts(void)
+ 	return 0;
+ }
+ 
++/*
++ * Called first in every exception handler, with which handler it is (1-8: bad sync, bad irq, bad fiq,
++ * bad error, sync, irq, fiq, error): for a board whose console is not up yet to show the fault some other way.
++ */
++__weak void board_exception_hook(struct pt_regs *regs, int kind)
++{
++}
++
+ static void show_efi_loaded_images(struct pt_regs *regs)
+ {
+ 	efi_print_image_infos((void *)regs->elr);
+@@ -145,6 +153,7 @@ static bool smh_emulate_trap(struct pt_regs *regs)
+  */
+ void do_bad_sync(struct pt_regs *pt_regs)
+ {
++	board_exception_hook(pt_regs, 1);
+ 	efi_restore_gd();
+ 	printf("Bad mode in \"Synchronous Abort\" handler, esr 0x%08lx\n",
+ 	       pt_regs->esr);
+@@ -158,6 +167,7 @@ void do_bad_sync(struct pt_regs *pt_regs)
+  */
+ void do_bad_irq(struct pt_regs *pt_regs)
+ {
++	board_exception_hook(pt_regs, 2);
+ 	efi_restore_gd();
+ 	printf("Bad mode in \"Irq\" handler, esr 0x%08lx\n", pt_regs->esr);
+ 	show_regs(pt_regs);
+@@ -170,6 +180,7 @@ void do_bad_irq(struct pt_regs *pt_regs)
+  */
+ void do_bad_fiq(struct pt_regs *pt_regs)
+ {
++	board_exception_hook(pt_regs, 3);
+ 	efi_restore_gd();
+ 	printf("Bad mode in \"Fiq\" handler, esr 0x%08lx\n", pt_regs->esr);
+ 	show_regs(pt_regs);
+@@ -182,6 +193,7 @@ void do_bad_fiq(struct pt_regs *pt_regs)
+  */
+ void do_bad_error(struct pt_regs *pt_regs)
+ {
++	board_exception_hook(pt_regs, 4);
+ 	efi_restore_gd();
+ 	printf("Bad mode in \"Error\" handler, esr 0x%08lx\n", pt_regs->esr);
+ 	show_regs(pt_regs);
+@@ -194,6 +206,7 @@ void do_bad_error(struct pt_regs *pt_regs)
+  */
+ void do_sync(struct pt_regs *pt_regs)
+ {
++	board_exception_hook(pt_regs, 5);
+ 	if (CONFIG_IS_ENABLED(SEMIHOSTING_FALLBACK) &&
+ 	    smh_emulate_trap(pt_regs))
+ 		return;
+@@ -211,6 +224,7 @@ void do_sync(struct pt_regs *pt_regs)
+  */
+ void do_irq(struct pt_regs *pt_regs)
+ {
++	board_exception_hook(pt_regs, 6);
+ 	efi_restore_gd();
+ 	printf("\"Irq\" handler, esr 0x%08lx\n", pt_regs->esr);
+ 	show_regs(pt_regs);
+@@ -223,6 +237,7 @@ void do_irq(struct pt_regs *pt_regs)
+  */
+ void do_fiq(struct pt_regs *pt_regs)
+ {
++	board_exception_hook(pt_regs, 7);
+ 	efi_restore_gd();
+ 	printf("\"Fiq\" handler, esr 0x%08lx\n", pt_regs->esr);
+ 	show_regs(pt_regs);
+@@ -238,6 +253,7 @@ void do_fiq(struct pt_regs *pt_regs)
+  */
+ void __weak do_error(struct pt_regs *pt_regs)
+ {
++	board_exception_hook(pt_regs, 8);
+ 	efi_restore_gd();
+ 	printf("\"Error\" handler, esr 0x%08lx\n", pt_regs->esr);
+ 	show_regs(pt_regs);
+diff --git a/board/samsung/exynos-mobile/Kconfig b/board/samsung/exynos-mobile/Kconfig
+index ed7d16b8..4765d8ca 100644
+--- a/board/samsung/exynos-mobile/Kconfig
++++ b/board/samsung/exynos-mobile/Kconfig
+@@ -6,6 +6,22 @@ config ENV_SOURCE_FILE
+ config LNX_KRNL_IMG_TEXT_OFFSET_BASE
+ 	default TEXT_BASE
+ 
++config EXYNOS_MOBILE_FB_MARKERS
++	bool "Show boot progress and faults in the Exynos990 framebuffer"
++	help
++	  Paint a bar into the framebuffer S-BOOT leaves on (0xF1000000,
++	  1440x3200) at each stage of the start, and an exception's ESR, ELR
++	  and FAR as rows of light (1) and dark (0) blocks: how far U-Boot
++	  gets before its console is up, seen in a photograph of the screen.
++
++config EXYNOS_MOBILE_FB_PROGRESS
++	bool "Also paint the boot's progress (stage bars, a square per initcall)"
++	depends on EXYNOS_MOBILE_FB_MARKERS
++	help
++	  With EXYNOS_MOBILE_FB_MARKERS a fault or a failing initcall is
++	  always shown; this adds the stage bars, a square for every initcall
++	  and the relocation addresses, for finding where a start stops.
++
+ config SYS_BOARD
+ 	default "exynos-mobile"
+ 
+diff --git a/board/samsung/exynos-mobile/exynos-mobile.c b/board/samsung/exynos-mobile/exynos-mobile.c
+index 6b2b1523..6b86ec8d 100644
+--- a/board/samsung/exynos-mobile/exynos-mobile.c
++++ b/board/samsung/exynos-mobile/exynos-mobile.c
+@@ -6,9 +6,24 @@
+  */
+ 
+ #include <asm/armv8/mmu.h>
++#include <asm/io.h>
++#include <asm/psci.h>
++#include <asm/ptrace.h>
++#include <asm/system.h>
++#include <asm/sections.h>
++#include <cpu_func.h>
++#include <malloc.h>
+ #include <blk.h>
+ #include <bootflow.h>
++#include <command.h>
+ #include <ctype.h>
++#include <cyclic.h>
++#include <video.h>
++#include <g_dnl.h>
++#include <linux/usb/gadget.h>
++#include <time.h>
++#include <linux/delay.h>
++#include <dm/device.h>
+ #include <dm/ofnode.h>
+ #include <efi.h>
+ #include <efi_loader.h>
+@@ -46,10 +60,13 @@ struct efi_capsule_update_info update_info = {
+  */
+ static struct mm_region exynos_mem_map[CONFIG_NR_DRAM_BANKS + 2] = {
+ 	{
+-		/* Peripheral MMIO block */
+-		.virt = 0x10000000UL,
+-		.phys = 0x10000000UL,
+-		.size = 0x10000000UL,
++		/*
++		 * Peripheral MMIO block, from 0: on the Exynos990 the APM's
++		 * SRAM (the ACPM firmware's IPC queues) is at 0x02039000.
++		 */
++		.virt = 0x00000000UL,
++		.phys = 0x00000000UL,
++		.size = 0x20000000UL,
+ 		.attrs = PTE_BLOCK_MEMTYPE(MT_DEVICE_NGNRNE) |
+ 			 PTE_BLOCK_NON_SHARE | PTE_BLOCK_PXN | PTE_BLOCK_UXN,
+ 	},
+@@ -88,12 +105,22 @@ static const char *exynos_prev_bl_get_bootargs(void)
+ 	return bootargs_prop->data;
+ }
+ 
++/*
++ * The RAM banks, from the device tree's memory nodes. S-BOOT on the Exynos990
++ * hands RAM over in 25 nodes, 20 of them 512 MiB pieces of one bank, and in
++ * descending order of address: every range is collected first, sorted, and
++ * ranges that go on where the last one ended are made one bank. Otherwise
++ * most of the RAM (and the framebuffer with it) would be left out of the MMU's
++ * map, and U-Boot stops at the first access to it after the MMU is on.
++ */
++#define EXYNOS_MAX_MEM_RANGES	64
++
+ static void exynos_parse_dram_banks(const void *fdt_base)
+ {
+-	u64 mem_addr, mem_size = 0;
+-	u32 na, ns, i;
+-	int index = 1;
+-	int offset;
++	u64 addr[EXYNOS_MAX_MEM_RANGES], size[EXYNOS_MAX_MEM_RANGES];
++	u64 mem_addr, mem_size = 0, t;
++	int n = 0, index = 1, i, j, offset;
++	u32 na, ns, k;
+ 
+ 	if (fdt_check_header(fdt_base) < 0)
+ 		return;
+@@ -106,26 +133,42 @@ static void exynos_parse_dram_banks(const void *fdt_base)
+ 		if (strncmp(fdt_get_name(fdt_base, offset, NULL), "memory", 6))
+ 			continue;
+ 
+-		for (i = 0; ; i++) {
+-			if (index > CONFIG_NR_DRAM_BANKS)
+-				break;
+-
++		for (k = 0; n < EXYNOS_MAX_MEM_RANGES; k++) {
+ 			mem_addr = fdtdec_get_addr_size_fixed(fdt_base, offset,
+-							      "reg", i, na, ns,
++							      "reg", k, na, ns,
+ 							      &mem_size, false);
+ 			if (mem_addr == FDT_ADDR_T_NONE)
+ 				break;
+-
+ 			if (!mem_size)
+ 				continue;
++			addr[n] = mem_addr;
++			size[n] = mem_size;
++			n++;
++		}
++	}
++
++	/* a handful of ranges: insertion sort by address */
++	for (i = 1; i < n; i++) {
++		for (j = i; j > 0 && addr[j - 1] > addr[j]; j--) {
++			t = addr[j]; addr[j] = addr[j - 1]; addr[j - 1] = t;
++			t = size[j]; size[j] = size[j - 1]; size[j - 1] = t;
++		}
++	}
+ 
+-			mem_map[index].phys = mem_addr;
+-			mem_map[index].virt = mem_addr;
+-			mem_map[index].size = mem_size;
+-			mem_map[index].attrs = PTE_BLOCK_MEMTYPE(MT_NORMAL) |
+-					       PTE_BLOCK_INNER_SHARE;
+-			index++;
++	for (i = 0; i < n; i++) {
++		if (index > 1 && mem_map[index - 1].phys +
++		    mem_map[index - 1].size == addr[i]) {
++			mem_map[index - 1].size += size[i];
++			continue;
+ 		}
++		if (index > CONFIG_NR_DRAM_BANKS)
++			break;
++		mem_map[index].phys = addr[i];
++		mem_map[index].virt = addr[i];
++		mem_map[index].size = size[i];
++		mem_map[index].attrs = PTE_BLOCK_MEMTYPE(MT_NORMAL) |
++				       PTE_BLOCK_INNER_SHARE;
++		index++;
+ 	}
+ }
+ 
+@@ -212,7 +255,8 @@ static int exynos_blk_env_setup(void)
+ 	blk_ifname = "mmc";
+ 	blk_desc = blk_get_dev(blk_ifname, blk_dev);
+ 	if (!blk_desc) {
+-		log_err("%s: required mmc device not available\n", __func__);
++		log_warning("%s: no mmc device: no partitions mapped\n",
++			    __func__);
+ 		return -ENODEV;
+ 	}
+ 
+@@ -249,11 +293,13 @@ static int exynos_blk_env_setup(void)
+ 
+ static int exynos_fastboot_setup(void)
+ {
++	phys_addr_t addr;
++#if CONFIG_IS_ENABLED(FASTBOOT_FLASH_MMC)
+ 	struct blk_desc *blk_dev;
+ 	struct disk_partition info = {0};
+ 	char buf[128];
+-	phys_addr_t addr;
+ 	int offset, i, j;
++#endif
+ 
+ 	/* Allocate and define buffer address for fastboot interface. */
+ 	if (lmb_alloc(CONFIG_FASTBOOT_BUF_SIZE, &addr)) {
+@@ -262,11 +308,11 @@ static int exynos_fastboot_setup(void)
+ 	}
+ 	env_set_hex("fastboot_addr_r", addr);
+ 
++#if CONFIG_IS_ENABLED(FASTBOOT_FLASH_MMC)
++	/* no mmc (a UFS phone): fastboot still takes downloads, it only has no partitions to name */
+ 	blk_dev = blk_get_dev("mmc", CONFIG_FASTBOOT_FLASH_MMC_DEV);
+-	if (!blk_dev) {
+-		log_err("%s: required mmc device not available\n", __func__);
+-		return -ENODEV;
+-	}
++	if (!blk_dev)
++		return 0;
+ 
+ 	strcpy(buf, "fastboot_partition_alias_");
+ 	offset = strlen(buf);
+@@ -290,12 +336,162 @@ static int exynos_fastboot_setup(void)
+ 		 */
+ 		env_set(buf, info.name);
+ 	}
++#endif
+ 
+ 	return 0;
+ }
+ 
++#if IS_ENABLED(CONFIG_EXYNOS_MOBILE_FB_MARKERS)
++/*
++ * Boot progress and faults, painted into the framebuffer S-BOOT leaves on the
++ * Exynos990 phones (1440x3200, 32 bits a pixel, 0xF1000000), for the time
++ * before U-Boot's console is up. Dim colours: an OLED panel, and short-lived.
++ *
++ *   stages (bars from the top): 1 red: first C code with a device tree;
++ *   2 green: RAM banks known; 3 blue: relocated, MMU and caches on;
++ *   4 grey: devices up, just before the menu.
++ *   a fault: a magenta bar, then rows of 64 blocks, most significant bit on
++ *   the left, light = 1: the handler (1-8), ESR, ELR from U-Boot's start,
++ *   FAR, LR from U-Boot's start, ELR as it is.
++ */
++#define MARK_FB			0xF1000000UL
++#define MARK_FB_WIDTH		1440
++#define MARK_FB_STRIDE		(1440 * 4)
++#define MARK_DECON_TRIGGER	0x19050070UL
++#define MARK_DECON_TRIGGER_ON	0x1281
++
++static void mark_fill(int y, int h, int x, int w, u32 colour)
++{
++	int r, c;
++
++	for (r = y; r < y + h; r++) {
++		u32 *p = (u32 *)(MARK_FB + (ulong)r * MARK_FB_STRIDE) + x;
++
++		for (c = 0; c < w; c++)
++			p[c] = colour;
++	}
++	flush_dcache_range(MARK_FB + (ulong)y * MARK_FB_STRIDE,
++			   MARK_FB + (ulong)(y + h) * MARK_FB_STRIDE);
++}
++
++static void mark_value(int y, u64 v)
++{
++	int bit, x = 60;
++
++	mark_fill(y, 40, 0, MARK_FB_WIDTH, 0xff000000);
++	for (bit = 63; bit >= 0; bit--) {
++		mark_fill(y, 40, x, 16, (v >> bit) & 1 ? 0xffc0c0c0 : 0xff383838);
++		x += 20;
++		if (bit % 4 == 0)
++			x += 4;
++	}
++}
++
++static void mark_stage(int stage, u32 colour)
++{
++	if (!IS_ENABLED(CONFIG_EXYNOS_MOBILE_FB_PROGRESS))
++		return;
++	writel(MARK_DECON_TRIGGER_ON, MARK_DECON_TRIGGER);
++	mark_fill(200 + stage * 120, 90, 0, MARK_FB_WIDTH, colour);
++}
++
++void board_exception_hook(struct pt_regs *regs, int kind)
++{
++	u64 far;
++
++	if (current_el() == 2)
++		asm volatile("mrs %0, far_el2" : "=r" (far));
++	else
++		asm volatile("mrs %0, far_el1" : "=r" (far));
++
++	writel(MARK_DECON_TRIGGER_ON, MARK_DECON_TRIGGER);
++	mark_fill(1000, 60, 0, MARK_FB_WIDTH, 0xff800080);
++	mark_value(1080, kind);
++	mark_value(1140, regs->esr);
++	mark_value(1200, regs->elr - (ulong)__image_copy_start);
++	mark_value(1260, far);
++	mark_value(1320, regs->regs[30] - (ulong)__image_copy_start);
++	mark_value(1380, regs->elr);
++	mark_value(1440, current_el());
++}
++
++/* up to 8 characters of a name as 8 bytes, the first one most significant */
++static u64 mark_chars(const char *s)
++{
++	u64 v = 0;
++	bool end = false;
++	int i;
++
++	for (i = 0; i < 8; i++) {
++		u8 c = 0;
++
++		if (!end) {
++			c = s[i];
++			end = !c;
++		}
++		v = v << 8 | c;
++	}
++	return v;
++}
++
++/*
++ * Every initcall (include/initcall.h): a small square for each one started,
++ * in a row for each sequence (before relocation, after it, others). One that
++ * fails: an orange bar and rows for its return value and its name (16
++ * characters). Before dram_init_banksize, where U-Boot is about to move:
++ * rows for ram_base, ram_size, ram_top, relocaddr, start_addr_sp, CurrentEL.
++ * The counters live in .data: BSS is not there before relocation.
++ */
++static int mark_count[3] __section(".data") = { 0, 0, 0 };
++
++void board_initcall_mark(const char *seq, const char *name, int ret)
++{
++	int row = 2;
++
++	if (!strcmp(seq, "initcall_run_f"))
++		row = 0;
++	else if (!strcmp(seq, "initcall_run_r"))
++		row = 1;
++
++	if (ret) {
++		writel(MARK_DECON_TRIGGER_ON, MARK_DECON_TRIGGER);
++		mark_fill(1500, 60, 0, MARK_FB_WIDTH, 0xffc06000);
++		mark_value(1580, (u64)(s64)ret);
++		mark_value(1640, mark_chars(name));
++		mark_value(1700, strlen(name) > 8 ? mark_chars(name + 8) : 0);
++		mark_value(1760, row);
++		return;
++	}
++
++	/* the progress (squares, addresses) only when asked for; a failure always */
++	if (!IS_ENABLED(CONFIG_EXYNOS_MOBILE_FB_PROGRESS))
++		return;
++
++	if (mark_count[row] < 70) {
++		mark_fill(760 + row * 60, 40, 8 + mark_count[row] * 20, 16,
++			  0xff007070);
++		mark_count[row]++;
++	}
++
++	if (!strcmp(name, "dram_init_banksize")) {
++		mark_value(1900, gd->ram_base);
++		mark_value(1960, gd->ram_size);
++		mark_value(2020, gd->ram_top);
++		mark_value(2080, gd->relocaddr);
++		mark_value(2140, gd->start_addr_sp);
++		mark_value(2200, current_el());
++	}
++}
++#else
++static inline void mark_stage(int stage, u32 colour)
++{
++}
++#endif
++
+ int board_fdt_blob_setup(void **fdtp)
+ {
++	mark_stage(1, 0xff800000);
++
+ 	/* If internal FDT is not available, use the external FDT instead. */
+ 	if (fdt_check_header(*fdtp))
+ 		*fdtp = (void *)get_prev_bl_fdt_addr();
+@@ -303,6 +499,51 @@ int board_fdt_blob_setup(void **fdtp)
+ 	return 0;
+ }
+ 
++/*
++ * U-Boot moves itself to the top of the largest RAM bank. On the Exynos990
++ * that end is the hypervisor's (el2_earlymem, the last 24 MiB below
++ * 0xB00000000, in S-BOOT's reserved-memory): stop below any reserved region
++ * in the upper half of the bank, in S-BOOT's device tree or U-Boot's own.
++ */
++static phys_addr_t exynos_clip_top(const void *fdt, phys_addr_t top)
++{
++	int rsv, node, na, ns, i;
++	fdt_size_t size;
++	fdt_addr_t addr;
++
++	if (!fdt || fdt_check_header(fdt) < 0)
++		return top;
++	rsv = fdt_path_offset(fdt, "/reserved-memory");
++	if (rsv < 0)
++		return top;
++	na = fdt_address_cells(fdt, rsv);
++	ns = fdt_size_cells(fdt, rsv);
++	fdt_for_each_subnode(node, fdt, rsv) {
++		for (i = 0; ; i++) {
++			addr = fdtdec_get_addr_size_fixed(fdt, node, "reg", i,
++							  na, ns, &size, false);
++			if (addr == FDT_ADDR_T_NONE)
++				break;
++			if (addr < top && addr + size > top - gd->ram_size / 2 &&
++			    addr >= gd->ram_base)
++				top = addr;
++		}
++	}
++	return top;
++}
++
++phys_addr_t board_get_usable_ram_top(phys_size_t total_size)
++{
++	phys_addr_t top = gd->ram_top;
++	int pass;
++
++	for (pass = 0; pass < 4; pass++) {
++		top = exynos_clip_top((const void *)get_prev_bl_fdt_addr(), top);
++		top = exynos_clip_top(gd->fdt_blob, top);
++	}
++	return top;
++}
++
+ int timer_init(void)
+ {
+ 	ofnode timer_node;
+@@ -319,10 +560,36 @@ int timer_init(void)
+ 	return 0;
+ }
+ 
++static bool exynos_fdt_has_memory(const void *fdt_base)
++{
++	int offset;
++
++	if (!fdt_base || fdt_check_header(fdt_base) < 0)
++		return false;
++
++	fdt_for_each_subnode(offset, fdt_base, 0)
++		if (!strncmp(fdt_get_name(fdt_base, offset, NULL), "memory", 6))
++			return true;
++
++	return false;
++}
++
+ int board_early_init_f(void)
+ {
+-	exynos_parse_dram_banks(gd->fdt_blob);
++	const void *prev_bl_fdt = (const void *)get_prev_bl_fdt_addr();
++
++	/*
++	 * The previous bootloader writes the RAM it found into the device
++	 * tree it hands over. When U-Boot carries its own device tree (the
++	 * phone's tree stays in boot.img for S-BOOT), that is still the best
++	 * account of the RAM: take it, and the built-in banks only without it.
++	 */
++	if (prev_bl_fdt != gd->fdt_blob && exynos_fdt_has_memory(prev_bl_fdt))
++		exynos_parse_dram_banks(prev_bl_fdt);
++	else
++		exynos_parse_dram_banks(gd->fdt_blob);
+ 
++	mark_stage(2, 0xff008000);
+ 	return 0;
+ }
+ 
+@@ -353,8 +620,1352 @@ int dram_init_banksize(void)
+ 	return 0;
+ }
+ 
++/*
++ * Exynos990 (Galaxy S20 family). S-BOOT leaves the panel's picture in the
++ * framebuffer, but with the display controller's refresh trigger off, so
++ * nothing drawn after it shows. Same fix as barebox, uniLoader and Linux:
++ * DECON_F HW_SW_TRIG_CONTROL = TRIG_AUTO_MASK_EN | SW_TRIG_EN | HW_TRIG_EN.
++ */
++#define EXYNOS990_DECON0_BASE		0x19050000UL
++#define DECON_HW_SW_TRIG_CONTROL	0x70
++#define DECON_TRIG_AUTO_MASK_EN		BIT(12)
++#define DECON_SW_TRIG_EN		BIT(8)
++#define DECON_HW_TRIG_EN		BIT(0)
++
++static void exynos990_screen_init(void)
++{
++	writel(DECON_TRIG_AUTO_MASK_EN | DECON_SW_TRIG_EN | DECON_HW_TRIG_EN,
++	       EXYNOS990_DECON0_BASE + DECON_HW_SW_TRIG_CONTROL);
++}
++
++/*
++ * The heat guard. The Exynos990 runs hot, and until the temperature is
++ * read (its sensors are behind the ACPM firmware), a run of U-Boot is
++ * kept short as well: after hakios_max_minutes (default 30) the phone is
++ * powered off (PSCI SYSTEM_OFF through SMC, as Samsung's own kernel calls
++ * PSCI). This runs whenever U-Boot waits (menu, fastboot, prompt).
++ */
++#define HEAT_GUARD_DEFAULT_MINUTES	30
++
++static struct cyclic_info heat_guard;
++static ulong heat_guard_start, heat_guard_limit_ms, heat_guard_last_read;
++static bool heat_guard_warned;
++#define HEAT_GUARD_MAX_C		70
++
++/*
++ * The Exynos990's APM: a small processor running Samsung's ACPM firmware,
++ * which owns the temperature sensors and the power sequencing. The main
++ * processor talks to it through message queues in the APM's SRAM and a
++ * mailbox that rings it, the way Samsung's kernel does
++ * (drivers/soc/samsung/acpm/acpm_ipc.c), polled here: no interrupts.
++ *
++ *   mailbox 0x15900000 (INTGR0 rings the APM: bit 16 + channel)
++ *   SRAM 0x02039000, the firmware's description of itself at +0x7000:
++ *   ipc_channels (+0x08), ipc_ap_max (+0x18); every channel's queues
++ *   are SRAM offsets. The AP sends into the channel's "rx" queue and reads
++ *   the answers from its "tx" queue. Channel 4: the framework (STOP),
++ *   channel 9: the temperature sensors (the phone's device tree says so).
++ */
++#define ACPM_MBOX			0x15900000UL
++#define ACPM_INTGR0			0x08
++#define ACPM_INTCR1			0x20
++#define ACPM_SRAM			0x02039000UL
++#define ACPM_INITDATA			(ACPM_SRAM + 0x7000)
++#define ACPM_INITDATA_IPC_CHANNELS	0x08
++#define ACPM_INITDATA_IPC_AP_MAX	0x18
++#define ACPM_CH_FRAMEWORK		4
++#define ACPM_CH_TMU			9
++#define ACPM_PROTOCOL_STOP		BIT(22)
++#define ACPM_SEQ_SHIFT			16
++#define ACPM_SEQ_MASK			(0x3f << ACPM_SEQ_SHIFT)
++#define ACPM_TIMEOUT_MS			50
++
++struct acpm_channel_info {
++	u32 rx_rear, rx_front, rx_base;
++	u32 rx_indr_buf, rx_indr_buf_base, rx_indr_buf_size;
++	u32 tx_rear, tx_front, tx_base;
++	u32 q_len, q_elem_size, credit, mbox_addr;
++};
++
++struct acpm_ipc_channel {
++	u32 id, field;
++	s32 owner;
++	u32 type;
++	struct acpm_channel_info ch;
++	u32 ap_poll;
++};
++
++static u32 acpm_seq __section(".data") = 0;
++
++static const struct acpm_ipc_channel *acpm_channel(u32 id)
++{
++	u32 chans = readl(ACPM_INITDATA + ACPM_INITDATA_IPC_CHANNELS);
++	u32 max = readl(ACPM_INITDATA + ACPM_INITDATA_IPC_AP_MAX);
++	const struct acpm_ipc_channel *ch;
++	u32 i;
++
++	if (!chans || chans >= 0x38000 || max == 0 || max > 32)
++		return NULL;
++	ch = (const struct acpm_ipc_channel *)(ACPM_SRAM + chans);
++	for (i = 0; i < max; i++)
++		if (readl(&ch[i].id) == id)
++			return &ch[i];
++	return NULL;
++}
++
++/* send cmd[4] on a channel and wait for its answer (into cmd): 0, or an error */
++static int acpm_send(u32 id, u32 *cmd)
++{
++	const struct acpm_ipc_channel *c = acpm_channel(id);
++	ulong start;
++	u32 len, size, front, next, rear, i, k, seq;
++
++	if (!c)
++		return -ENODEV;
++	len = readl(&c->ch.q_len);
++	size = readl(&c->ch.q_elem_size);
++	if (!len || len > 64 || size < 16 || size > 64)
++		return -EINVAL;
++
++	/* our message into the APM's queue */
++	front = readl(ACPM_SRAM + readl(&c->ch.rx_front));
++	next = (front + 1) % len;
++	start = get_timer(0);
++	while (next == readl(ACPM_SRAM + readl(&c->ch.rx_rear)))
++		if (get_timer(start) > ACPM_TIMEOUT_MS)
++			return -EBUSY;
++	acpm_seq = acpm_seq % 63 + 1;
++	seq = acpm_seq;
++	cmd[0] = (cmd[0] & ~ACPM_SEQ_MASK) | seq << ACPM_SEQ_SHIFT;
++	for (k = 0; k < size / 4; k++)
++		writel(k < 4 ? cmd[k] : 0, ACPM_SRAM + readl(&c->ch.rx_base) +
++		       size * front + 4 * k);
++	writel(next, ACPM_SRAM + readl(&c->ch.rx_front));
++	writel(BIT(id) << 16, ACPM_MBOX + ACPM_INTGR0);
++
++	/* its answer, the one with our sequence number, from its queue */
++	start = get_timer(0);
++	while (get_timer(start) <= ACPM_TIMEOUT_MS) {
++		front = readl(ACPM_SRAM + readl(&c->ch.tx_front));
++		rear = readl(ACPM_SRAM + readl(&c->ch.tx_rear));
++		for (i = rear; i != front; i = (i + 1) % len) {
++			ulong e = ACPM_SRAM + readl(&c->ch.tx_base) + size * i;
++
++			if (((readl(e) & ACPM_SEQ_MASK) >> ACPM_SEQ_SHIFT) != seq)
++				continue;
++			for (k = 0; k < 4; k++)
++				cmd[k] = readl(e + 4 * k);
++			/* dequeue: what was at rear moves into its place */
++			if (i != rear)
++				for (k = 0; k < size / 4; k++)
++					writel(readl(ACPM_SRAM + readl(&c->ch.tx_base) +
++						     size * rear + 4 * k), e + 4 * k);
++			rear = (rear + 1) % len;
++			writel(rear, ACPM_SRAM + readl(&c->ch.tx_rear));
++			if (rear == readl(ACPM_SRAM + readl(&c->ch.tx_front)))
++				writel(BIT(id), ACPM_MBOX + ACPM_INTCR1);
++			return 0;
++		}
++	}
++	return -ETIMEDOUT;
++}
++
++/*
++ * A temperature from the APM (TMU_IPC_READ_TEMP, Samsung's
++ * exynos_acpm_tmu.c): request type 0x02 and the zone in the second word;
++ * the answer has the temperature in degrees C in its top byte. Zones as the
++ * phone's device tree numbers them: 0 BIG (Mongoose), 1 MID (A76),
++ * 2 LITTLE (A55). Returns the temperature, or a negative error.
++ */
++#define TMU_IPC_READ_TEMP		0x02
++
++static int acpm_read_temp(u32 zone, u32 *raw)
++{
++	u32 cmd[4] = { 0, TMU_IPC_READ_TEMP | zone << 16, 0, 0 };
++	int ret = acpm_send(ACPM_CH_TMU, cmd);
++
++	if (raw) {
++		raw[0] = cmd[1];
++		raw[1] = cmd[2];
++	}
++	if (ret)
++		return ret;
++	return cmd[1] >> 24;
++}
++
++/* the hottest of the three CPU zones, or a negative error when none answers sanely */
++static int exynos990_cpu_temp(void)
++{
++	int zone, t, hottest = -ENODATA;
++
++	for (zone = 0; zone < 3; zone++) {
++		t = acpm_read_temp(zone, NULL);
++		if (t >= 5 && t <= 125 && t > hottest)
++			hottest = t;
++	}
++	return hottest;
++}
++
++static int do_x1s_temp(struct cmd_tbl *cmdtp, int flag, int argc,
++		       char *const argv[])
++{
++	/* the phone's device tree's thermal-zones, in their order: BIG, MID, LITTLE, G3D, ISP, NPU */
++	static const char *const names[] = { "BIG (Mongoose)", "MID (A76)",
++					     "LITTLE (A55)", "G3D (GPU)", "ISP",
++					     "NPU" };
++	u32 raw[2];
++	int zone, t;
++
++	for (zone = 0; zone < 6; zone++) {
++		t = acpm_read_temp(zone, raw);
++		if (t < 0)
++			printf("%-15s no answer (%d)\n", names[zone], t);
++		else
++			printf("%-15s %3d C   (raw %08x %08x)\n", names[zone],
++			       t, raw[0], raw[1]);
++	}
++	return CMD_RET_SUCCESS;
++}
++
++U_BOOT_CMD(temp, 1, 0, do_x1s_temp,
++	   "temperatures from the Exynos990's APM (ACPM firmware)", "");
++
++/*
++ * The GPU (Mali-G77), read only (devices/x1s/PLAN.md "GPU", step G1). From the phone's device tree: the Mali at
++ * 0x18500000, its power domain pd-embedded_g3d at PMU 0x15862200 (CONFIGURATION, STATUS +4, OPTION +8; the Mali
++ * driver's gpu_pmu_status_reg_offset 0x2204 with local_pwr_mask 1: STATUS bit 0 is "on"), its temperature the APM's
++ * zone 3. The Mali's own registers are read only when the domain says it is on: a block without power never answers.
++ * Mali job-manager registers: GPU_ID 0x000, L2_FEATURES 0x004, GPU_STATUS 0x034, AS_PRESENT 0x018, JS_PRESENT 0x01c,
++ * SHADER_PRESENT 0x100, TILER_PRESENT 0x110, L2_PRESENT 0x120, SHADER_READY 0x140 (Linux's panfrost_regs.h).
++ */
++static void usbcheck_line(const char *what, ulong addr);
++
++static int do_x1s_gpucheck(struct cmd_tbl *cmdtp, int flag, int argc,
++			   char *const argv[])
++{
++	static const struct { const char *name; ulong off; } mali[] = {
++		{ "Mali GPU_ID", 0x000 }, { "Mali L2_FEATURES", 0x004 }, { "Mali AS_PRESENT", 0x018 },
++		{ "Mali JS_PRESENT", 0x01c }, { "Mali GPU_STATUS", 0x034 }, { "Mali SHADER_PRESENT", 0x100 },
++		{ "Mali TILER_PRESENT", 0x110 }, { "Mali L2_PRESENT", 0x120 }, { "Mali SHADER_READY", 0x140 },
++	};
++	u32 raw[2];
++	int i, t;
++
++	printf("GPU check (read only):\n");
++	usbcheck_line("G3D domain CONFIGURATION", 0x15862200UL);
++	usbcheck_line("G3D domain STATUS (bit 0: on)", 0x15862204UL);
++	usbcheck_line("G3D domain OPTION", 0x15862208UL);
++	t = acpm_read_temp(3, raw);
++	if (t < 0)
++		printf("  G3D temperature: no answer (%d)\n", t);
++	else
++		printf("  G3D temperature: %d C (raw %08x %08x)\n", t, raw[0], raw[1]);
++	if (!(readl(0x15862204UL) & 1)) {
++		printf("  the GPU's power domain is off: its registers are not read\n");
++	} else {
++		for (i = 0; i < ARRAY_SIZE(mali); i++)
++			usbcheck_line(mali[i].name, 0x18500000UL + mali[i].off);
++	}
++	printf("done\n");
++	return CMD_RET_SUCCESS;
++}
++
++U_BOOT_CMD(gpucheck, 1, 0, do_x1s_gpucheck,
++	   "the GPU's power domain, temperature and (when on) its ID, read only", "");
++
++/*
++ * The phone's storage (UFS), read only (devices/x1s/PLAN.md "iOS from the phone's own storage", step S1): how S-BOOT
++ * leaves the UFS host controller when it starts the boot image -- whether it is still on, the link to the flash up and
++ * its transfer list in place, which a driver that adopts it (no reset, no PHY setup) needs. Addresses from Samsung's
++ * exynos9830 device tree (as Scion's socs/exynos990 has them): UFSHCI at 0x13100000, the Exynos vendor registers at
++ * 0x13101100, the IO-coherency bits in SYSREG_HSI 0x13020700. Nothing is written anywhere: no register, no list, no
++ * command to the flash. UFSHCI 0x38-0x48 (the UIC error codes) clear when they are read: never read here. The vendor
++ * registers and S-BOOT's transfer list are read only when the controller says it is enabled.
++ */
++static int do_x1s_ufscheck(struct cmd_tbl *cmdtp, int flag, int argc,
++			   char *const argv[])
++{
++	static const struct { const char *name; ulong off; } hci[] = {
++		{ "UFS CAP", 0x00 }, { "UFS VER", 0x08 }, { "UFS HCDDID", 0x10 }, { "UFS HCPMID", 0x14 },
++		{ "UFS AHIT", 0x18 }, { "UFS IS", 0x20 }, { "UFS IE", 0x24 }, { "UFS HCS", 0x30 },
++		{ "UFS UTRIACR", 0x4c }, { "UFS UTRLBA", 0x50 }, { "UFS UTRLBAU", 0x54 }, { "UFS UTRLDBR", 0x58 },
++		{ "UFS UTRLRSR", 0x60 }, { "UFS UTRLCNR", 0x64 }, { "UFS UTMRLBA", 0x70 }, { "UFS UTMRLBAU", 0x74 },
++		{ "UFS UTMRLDBR", 0x78 }, { "UFS UTMRLRSR", 0x80 },
++	};
++	static const struct { const char *name; ulong off; } vs[] = {
++		{ "VS TXPRDT_ENTRY_SIZE", 0x00 }, { "VS RXPRDT_ENTRY_SIZE", 0x04 }, { "VS 1US_TO_CNT_VAL", 0x0c },
++		{ "VS UTRL_NEXUS_TYPE", 0x40 }, { "VS UTMRL_NEXUS_TYPE", 0x44 }, { "VS SW_RST", 0x50 },
++		{ "VS DATA_REORDER", 0x60 }, { "VS AXIDMA_BURST", 0x6c }, { "VS GPIO_OUT (bit 0: device out of reset)", 0x70 },
++		{ "VS CLKSTOP_CTRL", 0xb0 }, { "VS FORCE_HCS", 0xb4 }, { "VS UFS_ACG_DISABLE", 0xfc },
++		{ "VS IOP_ACG_DISABLE", 0x100 }, { "VS MPHY_REFCLK_SEL", 0x108 },
++	};
++	const ulong base = 0x13100000UL, vbase = 0x13101100UL;
++	u32 hce, hcs, rsr, lba, lbau, stop;
++	u64 list;
++	int i;
++
++	printf("Storage (UFS) check, read only:\n");
++	usbcheck_line("UFS HCE (bit 0: enabled)", base + 0x34);
++	hce = readl(base + 0x34);
++	for (i = 0; i < ARRAY_SIZE(hci); i++)
++		usbcheck_line(hci[i].name, base + hci[i].off);
++	usbcheck_line("SYSREG IO coherency", 0x13020700UL);
++	if (!(hce & 1)) {
++		printf("  the controller is OFF: S-BOOT switched it off (a driver must bring it up from scratch)\n");
++		printf("done\n");
++		return CMD_RET_SUCCESS;
++	}
++	for (i = 0; i < ARRAY_SIZE(vs); i++)
++		usbcheck_line(vs[i].name, vbase + vs[i].off);
++
++	hcs = readl(base + 0x30);
++	rsr = readl(base + 0x60);
++	lba = readl(base + 0x50);
++	lbau = readl(base + 0x54);
++	stop = readl(vbase + 0xb0);
++	list = ((u64)lbau << 32) | (lba & ~0x3ffu);
++	printf("  controller ON; flash present: %s; transfer list ready: %s, running: %s; list at %llx\n",
++	       (hcs & 1) ? "yes" : "NO", (hcs & 2) ? "yes" : "NO", (rsr & 1) ? "yes" : "NO", list);
++	printf("  PRDT entry size (S-BOOT's): tx %u rx %u (12 = plain 16-byte entries); flash %s; clocks stopped %x\n",
++	       readl(vbase + 0x00) & 0x1f, readl(vbase + 0x04) & 0x1f,
++	       (readl(vbase + 0x70) & 1) ? "out of reset" : "HELD IN RESET", stop & 0xf);
++	/* S-BOOT's first request descriptor, only if its list lies in one of the RAM banks U-Boot maps (else not read) */
++	for (i = 0; i < CONFIG_NR_DRAM_BANKS; i++)
++		if (gd->bd->bi_dram[i].size && list >= gd->bd->bi_dram[i].start &&
++		    list + 32 <= gd->bd->bi_dram[i].start + gd->bd->bi_dram[i].size)
++			break;
++	if (list && i < CONFIG_NR_DRAM_BANKS) {
++		printf("  S-BOOT's slot 0:");
++		for (i = 0; i < 8; i++)
++			printf(" %08x", readl((ulong)list + i * 4));
++		printf("\n");
++	} else {
++		printf("  S-BOOT's list is outside U-Boot's RAM banks: not read\n");
++	}
++	printf("done\n");
++	return CMD_RET_SUCCESS;
++}
++
++U_BOOT_CMD(ufscheck, 1, 0, do_x1s_ufscheck,
++	   "how S-BOOT left the storage (UFS) controller, read only", "");
++
++/*
++ * The power chip (S2MPS19), through the APM as Samsung's kernel reaches it
++ * (acpm_mfd.c): ACPM channel 2, speedy bus 0. cmd0 = block << 8 | reg |
++ * bus << 12; cmd1 = function (0 read, 2 update) | value << 8 | mask << 16;
++ * the answer: the value read in cmd1 bits 8-15, an error in bits 24-31.
++ * Blocks: 0x01 PMIC, 0x02 RTC. RTC 0x01 is WTSR_SMPL: bit 6 WTSR (restart
++ * when PWRHOLD drops), bit 7 SMPL (restart after a sudden power loss);
++ * RTC 0x03 CAPSEL bit 3: SUB_SMPL. Samsung's kernel clears all three before
++ * it powers the phone off (rtc-s2mps19.c, s2m_rtc_shutdown()).
++ */
++#define ACPM_CH_MFD			2
++#define PMIC_SPEEDY_BUS			0
++#define PMIC_BLOCK_RTC			0x02
++#define PMIC_RTC_WTSR_SMPL		0x01
++#define PMIC_RTC_CAPSEL			0x03
++#define PMIC_WTSR_EN			BIT(6)
++#define PMIC_SMPL_EN			BIT(7)
++#define PMIC_SUB_SMPL_EN		BIT(3)
++#define MFD_FUNC_READ			0
++#define MFD_FUNC_UPDATE			2
++
++static int acpm_pmic_read(u32 block, u32 reg, u8 *val)
++{
++	u32 cmd[4] = { (block & 0xf) << 8 | (reg & 0xff) |
++		       (PMIC_SPEEDY_BUS & 0xf) << 12, MFD_FUNC_READ, 0, 0 };
++	int ret = acpm_send(ACPM_CH_MFD, cmd);
++
++	if (ret)
++		return ret;
++	if ((cmd[1] >> 24) & 0xff)
++		return -EIO;
++	*val = (cmd[1] >> 8) & 0xff;
++	return 0;
++}
++
++static int acpm_pmic_update(u32 block, u32 reg, u8 val, u8 mask)
++{
++	u32 cmd[4] = { (block & 0xf) << 8 | (reg & 0xff) |
++		       (PMIC_SPEEDY_BUS & 0xf) << 12,
++		       MFD_FUNC_UPDATE | val << 8 | mask << 16, 0, 0 };
++	int ret = acpm_send(ACPM_CH_MFD, cmd);
++
++	if (ret)
++		return ret;
++	return (cmd[1] >> 24) & 0xff ? -EIO : 0;
++}
++
++/* S-BOOT's notes on why the phone came on and why it last went off, found in RAM */
++static void sboot_power_notes(void)
++{
++	static const char *const keys[] = { "PMIC_PWRONSRC", "PMIC_OFFSRC" };
++	const char *p = (const char *)0x80000000UL;
++	const char *end = (const char *)0x96000000UL;	/* secure_camera after */
++	int found = 0, k, n;
++
++	for (; p < end - 64 && found < 12; p++) {
++		if (*p != 'P')
++			continue;
++		for (k = 0; k < 2; k++) {
++			if (memcmp(p, keys[k], strlen(keys[k])))
++				continue;
++			printf("  %08lx: ", (ulong)p);
++			/* to the end of S-BOOT's line; odd bytes in it shown as '.' */
++			for (n = 0; n < 48 && p[n] && p[n] != '\n' && p[n] != '\r'; n++)
++				putc(p[n] >= ' ' && p[n] < 127 ? p[n] : '.');
++			putc('\n');
++			found++;
++		}
++	}
++	if (!found)
++		printf("  S-BOOT's notes not found in RAM\n");
++}
++
++static int do_x1s_pmic(struct cmd_tbl *cmdtp, int flag, int argc,
++		       char *const argv[])
++{
++	u8 v;
++	int ret;
++
++	ret = acpm_pmic_read(PMIC_BLOCK_RTC, PMIC_RTC_WTSR_SMPL, &v);
++	if (ret)
++		printf("RTC WTSR_SMPL: no answer (%d)\n", ret);
++	else
++		printf("RTC WTSR_SMPL = 0x%02x: WTSR %s, SMPL %s\n", v,
++		       v & PMIC_WTSR_EN ? "ON" : "off",
++		       v & PMIC_SMPL_EN ? "ON" : "off");
++	ret = acpm_pmic_read(PMIC_BLOCK_RTC, PMIC_RTC_CAPSEL, &v);
++	if (ret)
++		printf("RTC CAPSEL: no answer (%d)\n", ret);
++	else
++		printf("RTC CAPSEL = 0x%02x: SUB_SMPL %s\n", v,
++		       v & PMIC_SUB_SMPL_EN ? "ON" : "off");
++	printf("S-BOOT's power notes in RAM:\n");
++	sboot_power_notes();
++	return CMD_RET_SUCCESS;
++}
++
++U_BOOT_CMD(pmic, 1, 0, do_x1s_pmic,
++	   "read the power chip's restart features (WTSR, SMPL); S-BOOT's power notes", "");
++
++/*
++ * A restart with a note for S-BOOT, as Samsung's kernel leaves it (sec_reboot.c): PMU INFORM3
++ * (SEC_DEBUG_PANIC_INFORM) holds the reason, 0x12345600 | 4 for recovery (TWRP), | 0 for none;
++ * INFORM2 (SEC_DEBUG_MAGIC_INFORM) bits 16-23 = 0x4E, a normal restart and not the charging
++ * mode. Notes only: these registers survive the restart for the bootloader to read.
++ */
++#define EXYNOS990_PMU_INFORM2		0x15860808UL
++#define EXYNOS990_PMU_INFORM3		0x1586080cUL
++#define SEC_RESET_REASON_PREFIX		0x12345600
++#define SEC_RESET_REASON_RECOVERY	(SEC_RESET_REASON_PREFIX | 0x04)
++#define SEC_RESET_REASON_UNKNOWN	(SEC_RESET_REASON_PREFIX | 0x00)
++#define SEC_REBOOT_NORMAL		0x4e
++
++static int do_x1s_restart(struct cmd_tbl *cmdtp, int flag, int argc,
++			  char *const argv[])
++{
++	bool recovery = argc > 1 && !strcmp(argv[1], "recovery");
++
++	if (!of_machine_is_compatible("samsung,exynos990"))
++		return run_command("reset", 0);
++	printf("[x1s] restarting%s\n", recovery ? " into recovery (TWRP)" : "");
++	clrsetbits_le32(EXYNOS990_PMU_INFORM2, 0xff << 16, SEC_REBOOT_NORMAL << 16);
++	writel(recovery ? SEC_RESET_REASON_RECOVERY : SEC_RESET_REASON_UNKNOWN,
++	       EXYNOS990_PMU_INFORM3);
++	flush_dcache_all();
++	mdelay(500);
++	return run_command("reset", 0);
++}
++
++U_BOOT_CMD(restart, 2, 0, do_x1s_restart,
++	   "restart the phone, with S-BOOT's note: 'restart' (normal) or 'restart recovery' (TWRP)",
++	   "[recovery]");
++
++/*
++ * USB, read only: the clock gates S-BOOT left (Linux's clk-exynos990.c:
++ * CMU_TOP 0x1A330000, CMU_HSI0 0x10A00000; bit 21 of a gate is its enable),
++ * then one register of the USB PHY (0x10C00000) and the DWC3 controller's ID
++ * (GSNPSID, 0x10E0C120). A line is shown before every read of a USB block:
++ * if one hangs (its clock off, the bus never answers), the last line on the
++ * screen says which.
++ */
++static void usbcheck_line(const char *what, ulong addr)
++{
++	printf("  %-34s %08lx = ", what, addr);
++	video_sync_all();
++	flush_dcache_all();
++	printf("%08x\n", readl(addr));
++	video_sync_all();
++}
++
++static int do_x1s_usbcheck(struct cmd_tbl *cmdtp, int flag, int argc,
++			   char *const argv[])
++{
++	static const struct { const char *name; ulong addr; } gates[] = {
++		{ "TOP gate HSI0_BUS",		0x1A330000UL + 0x207c },
++		{ "TOP gate HSI0_USB31DRD",	0x1A330000UL + 0x2084 },
++		{ "TOP mux HSI0_USB31DRD",	0x1A330000UL + 0x1080 },
++		{ "TOP div HSI0_USB31DRD",	0x1A330000UL + 0x1878 },
++		{ "HSI0 user mux BUS",		0x10A00000UL + 0x0600 },
++		{ "HSI0 user mux USB31DRD",	0x10A00000UL + 0x0620 },
++		{ "HSI0 gate SYSMMU_USB",	0x10A00000UL + 0x2024 },
++		{ "HSI0 gate ACLK_PHYCTRL",	0x10A00000UL + 0x202c },
++		{ "HSI0 gate BUS_CLK_EARLY",	0x10A00000UL + 0x2030 },
++		{ "HSI0 gate REF_CLK_40",	0x10A00000UL + 0x2034 },
++		{ "HSI0 gate USBDPPHY_REF_SOC_PLL", 0x10A00000UL + 0x2038 },
++		{ "HSI0 gate USBDPPHY_SCL_APB",	0x10A00000UL + 0x203c },
++		{ "HSI0 gate USBPCS_APB",	0x10A00000UL + 0x2040 },
++		{ "PMU USB20 PHY control",	0x15860000UL + 0x072c },
++		{ "PHY LINKCTRL",		0x10C00000UL + 0x04 },
++		{ "PHY UTMI",			0x10C00000UL + 0x50 },
++		{ "DWC3 GSNPSID",		0x10E00000UL + 0xc120 },
++		{ "DWC3 GCTL",			0x10E00000UL + 0xc110 },
++		{ "DWC3 DCTL",			0x10E00000UL + 0xc704 },
++	};
++	int i;
++
++	printf("USB check (read only):\n");
++	for (i = 0; i < ARRAY_SIZE(gates); i++)
++		usbcheck_line(gates[i].name, gates[i].addr);
++	printf("done\n");
++	return CMD_RET_SUCCESS;
++}
++
++U_BOOT_CMD(usbcheck, 1, 0, do_x1s_usbcheck,
++	   "the USB block's clocks and IDs, read only", "");
++
++/*
++ * The touch screen's bus, read only. The touch chip (sec,sec_ts at 0x48, firmware y79a) is on hsi2c15 at
++ * 0x108D0000 (USI07's I2C, in PERIC1); its interrupt line is GPA1-0 (alive pin controller, low = an event waits);
++ * the bus pins are GPP5-6/7 (function 3 for I2C). The clocks are CMU_TOP's PERIC1 BUS and IP and CMU_PERIC1's
++ * (0x10700000, Linux's clk-exynos990.c: the gates it names, six to a line). The CMUs and the pin
++ * controllers are always readable; the I2C block is read last, a line on the screen before each of its registers
++ * (a gated block that never answers stops the phone there: force restart).
++ */
++/* CMU_PERIC1's gate registers, as Linux's clk-exynos990.c lists them (no others: the range has holes) */
++static const u16 peric1_gates[] = {
++	0x2004, 0x2008, 0x200c, 0x2010, 0x2014, 0x2018, 0x201c, 0x2020, 0x2024, 0x2028, 0x202c, 0x2030,
++	0x2034, 0x2038, 0x203c, 0x2040, 0x2044, 0x2048, 0x204c, 0x2050, 0x2054, 0x2058, 0x205c, 0x2060,
++	0x2064, 0x206c, 0x2070, 0x2074, 0x2078, 0x207c, 0x2080, 0x2084, 0x2088, 0x208c, 0x2090, 0x2098,
++	0x209c, 0x20a0, 0x20a4, 0x20ac, 0x20b0, 0x20b4, 0x20b8, 0x20bc, 0x20c0, 0x20c4, 0x20c8, 0x20cc,
++	0x20d0, 0x20d8, 0x20dc, 0x20e0, 0x20e4, 0x20e8, 0x20ec, 0x20f0, 0x20f4, 0x20f8, 0x20fc, 0x2100,
++	0x2104, 0x2108, 0x210c, 0x2110, 0x2114, 0x2118, 0x211c,
++};
++
++static int do_x1s_touchcheck(struct cmd_tbl *cmdtp, int flag, int argc,
++			     char *const argv[])
++{
++	static const struct { const char *name; ulong addr; } regs[] = {
++		{ "TOP gate PERIC1_BUS",	0x1A330000UL + 0x20d4 },
++		{ "TOP gate PERIC1_IP",		0x1A330000UL + 0x20d8 },
++		{ "TOP mux PERIC1_BUS",		0x1A330000UL + 0x10d4 },
++		{ "TOP mux PERIC1_IP",		0x1A330000UL + 0x10d8 },
++		{ "TOP div PERIC1_BUS",		0x1A330000UL + 0x18cc },
++		{ "TOP div PERIC1_IP",		0x1A330000UL + 0x18d0 },
++		{ "PERIC1 user mux USI_I2C",	0x10700000UL + 0x06c0 },
++		{ "PERIC1 div USI_I2C",		0x10700000UL + 0x182c },
++		{ "GPP5 CON (pins 6,7: I2C=3)",	0x10730000UL + 0x00 },
++		{ "GPP5 DAT",			0x10730000UL + 0x04 },
++		{ "GPP5 PUD",			0x10730000UL + 0x08 },
++		{ "GPP5 DRV",			0x10730000UL + 0x0c },
++		{ "GPA1 CON (pin 0: EINT=0xf)",	0x15850000UL + 0x20 },
++		{ "GPA1 DAT (bit 0: touch IRQ)",	0x15850000UL + 0x24 },
++		{ "GPA1 PUD",			0x15850000UL + 0x28 },
++	};
++	static const struct { const char *name; ulong off; } i2c[] = {
++		{ "HSI2C15 CTL",		0x00 },
++		{ "HSI2C15 FIFO_CTL",		0x04 },
++		{ "HSI2C15 INT_STATUS",		0x24 },
++		{ "HSI2C15 FIFO_STATUS",	0x30 },
++		{ "HSI2C15 CONF",		0x40 },
++		{ "HSI2C15 TRANS_STATUS",	0x50 },
++		{ "HSI2C15 TIMING_FS1",		0x60 },
++		{ "HSI2C15 USI_CON (0: running)", 0xc4 },
++		{ "HSI2C15 USI_OPTION",		0xc8 },
++	};
++	ulong a;
++	int i;
++
++	printf("Touch check (read only):\n");
++	for (i = 0; i < ARRAY_SIZE(regs); i++)
++		usbcheck_line(regs[i].name, regs[i].addr);
++	/*
++	 * Only the gates Linux's clk-exynos990.c names: the range has holes (0x2068 among them), and reading one is an
++	 * external abort (test 16: "Synchronous Abort", far 0x1070206x).
++	 */
++	printf("  PERIC1 gates (offset=value):\n");
++	for (i = 0, a = 0; i < ARRAY_SIZE(peric1_gates); i++) {
++		printf("%s%04x=%08x", a % 6 ? " " : "  ", peric1_gates[i],
++		       readl(0x10700000UL + peric1_gates[i]));
++		if (++a % 6 == 0)
++			printf("\n");
++	}
++	printf("\n");
++	video_sync_all();
++	printf("  touch IRQ (GPA1-0) 5 times:");
++	for (i = 0; i < 5; i++) {
++		printf(" %d", readl(0x15850024UL) & 1);
++		mdelay(20);
++	}
++	printf("\n");
++	for (i = 0; i < ARRAY_SIZE(i2c); i++)
++		usbcheck_line(i2c[i].name, 0x108D0000UL + i2c[i].off);
++	printf("done\n");
++	return CMD_RET_SUCCESS;
++}
++
++U_BOOT_CMD(touchcheck, 1, 0, do_x1s_touchcheck,
++	   "the touch screen's bus, clocks and pins, read only", "");
++
++/*
++ * The touch screen for 20 s: the fingers it reports, on the screen. What is written, all of it (the owner's OK first):
++ *   GPP5 CON 0x10730000 bits 24-31 = 0x33   pins 6, 7 to I2C (function 3), the other pins as they are
++ *   GPP5 PUD 0x10730008 bits 24-31 = 0      no pull on them (the device tree's pin-pud 0)
++ *   GPA1 PUD 0x15850028 bits 0-3 = 0        no pull-down on the touch IRQ line (the chip drives it)
++ *   HSI2C15 0x108D0000                      the I2C controller itself: out of reset (USI_CON 0xC4 = 0), master,
++ *                                           auto mode, timing for 100 kHz at a 200 MHz input (slower if the input
++ *                                           is slower), then its transfer registers for each message
++ *   the touch chip (I2C 0x48)               0x55 and 0x22 read, 0x62 clear its event stack, 0x10 sensing on,
++ *                                           0x60/0x61 events read; at the end 0x11 sensing off
++ *   S2DOS05 (I2C 0x60, by hand on GPP1-0/1) EN 0x03 |= 0x06 (LDO2 tsp_io 1.8 V, LDO3 tsp_avdd 3.0 V) first, only if
++ *                                           their voltage registers already say so, and EN back as it was at the end
++ *   "touchtest usi" only: 0x10721024 = 4    our USI's mode register to I2C (Samsung's usi_v2.c I2C_SW_CONF)
++ * Test 17: without its supplies the chip did not answer (-ENODEV) and the bus pins read low (their pull-ups are on
++ * tsp_io). Test 19: the supplies came on (EN 0x19 -> 0x1f) and it still did not answer; CTL read 0 after 0x8 was
++ * written, so now master mode is set in every message, and the controller's state is shown when a message fails.
++ * No clock or storage is written. The pins are left as they are at the end (U-Boot is the only user).
++ * Samsung's kernel: drivers/i2c/busses/i2c-exynos5.c (polled transfers), drivers/input/touchscreen/sec_ts/y79a.
++ */
++#define HSI2C15			0x108D0000UL	/* the touch chip's bus */
++#define HSI2C4			0x10590000UL	/* the display power chip's (S2DOS05) controller: left in reset (test 18), only read */
++#define HSI2C_REG(o)		(HSI2C15 + (o))
++#define TS_ADDR			0x48
++#define DOS_ADDR		0x60
++
++static void hsi2c_reset(ulong b)
++{
++	setbits_le32(b + 0x00, BIT(31));		/* CTL: SW_RST */
++	clrbits_le32(b + 0x00, BIT(31));
++	writel(BIT(3), b + 0x00);			/* CTL: master */
++	writel(0xffffff, b + 0x08);			/* TRAILIG_CTL */
++	setbits_le32(b + 0x40, BIT(31));		/* CONF: auto mode */
++}
++
++/* i2c-exynos5.c's fast-mode timing, for op_clk at an input of ipclk */
++static void hsi2c_timing(ulong b, u32 ipclk, u32 op_clk)
++{
++	u32 div = (ipclk / (op_clk * 15)) & 0xff;
++	u32 h = ((9 * ipclk) / (1000 * 1000)) / ((div + 1) * 10);
++	u32 start = (9 * ipclk / (1000 * 1000)) / ((div + 1) * 10) - 1;
++
++	h = ((0xffffffffU >> h) << h) & 0xff;
++	start = ((0xffffffffU >> start) << start) & 0xff;
++	clrsetbits_le32(b + 0x68, 0xff << 16, div << 16);	/* TIMING_FS3 */
++	clrsetbits_le32(b + 0x64, 0xff, h);			/* TIMING_FS2 */
++	clrsetbits_le32(b + 0x60, 0xff << 16, start << 16);	/* TIMING_FS1 */
++}
++
++/*
++ * One message to device dev on the bus at b, polled, with a stop after it (both buses' device-tree nodes:
++ * samsung,stop-after-trans or a single message). 0, or a negative error. The controller is not reset on an error
++ * here: on the power chip's bus that is S-BOOT's set-up, left as it is.
++ */
++static int hsi2c_msg(ulong b, u8 dev, bool read, u8 *buf, int len)
++{
++	u32 ctl = readl(b + 0x00), conf, addr;
++	ulong start = get_timer(0);
++	int n = 0;
++
++	clrbits_le32(b + 0x48, BIT(31));				/* TIMEOUT off */
++	writel(BIT(0) | BIT(1) | (min(len, 0x40) << 4) | (min(len, 0x40) << 16), b + 0x04);	/* FIFO_CTL */
++	ctl &= ~(BIT(6) | BIT(7));
++	ctl |= read ? BIT(6) : BIT(7);					/* RXCHON or TXCHON */
++	ctl |= BIT(3);		/* master, whatever CTL read back (test 19: it read 0 after 0x8 was written to it) */
++	conf = readl(b + 0x44);						/* AUTO_CONF */
++	conf = read ? conf | BIT(16) : conf & ~BIT(16);
++	conf |= BIT(17);						/* stop after it */
++	addr = readl(b + 0x70) & ~((0x3ff << 10) | 0x3ff | (0xff << 24));
++	addr |= (0x7 << 24) | (dev << 10);
++	writel(addr, b + 0x70);
++	writel(ctl, b + 0x00);
++	/*
++	 * INT_ENABLE: transfer done, and the transfer-state errors (bits 8-11; bit 10 = no device answered), as
++	 * i2c-exynos5.c's interrupt handler reads them from INT_STATUS. TRANS_STATUS is not an error register on this
++	 * controller: its low four bits are the master's state (test 20: 0x9, a transfer in progress, which an older
++	 * reading of it here took for "no device").
++	 */
++	writel(BIT(7) | (0xf << 8), b + 0x20);
++	writel(readl(b + 0x24), b + 0x24);				/* INT_STATUS cleared */
++	conf = (conf & ~0xffff) | len;
++	writel(conf, b + 0x44);
++	writel(conf | BIT(31), b + 0x44);				/* master run */
++	while (get_timer(start) < 100) {
++		u32 fifo = readl(b + 0x30), ints = readl(b + 0x24);
++
++		if (ints & BIT(10)) {					/* no device answered */
++			writel(ints, b + 0x24);
++			return -ENODEV;
++		}
++		if (ints & (0xb << 8)) {				/* another transfer error */
++			writel(ints, b + 0x24);
++			return -EIO;
++		}
++		if (read) {
++			if (!(fifo & BIT(24)))
++				buf[n++] = readl(b + 0x38);
++			if (n >= len)
++				return 0;
++		} else {
++			if (n < len && (fifo & 0x7f) < 0x40)
++				writel(buf[n++], b + 0x34);
++			if (n >= len && (readl(b + 0x24) & BIT(7)) && (fifo & BIT(8))) {
++				writel(readl(b + 0x24), b + 0x24);
++				return 0;
++			}
++		}
++	}
++	return -ETIMEDOUT;
++}
++
++/* the touch bus's controller as it was when its last message failed: CTL, INT_STATUS, FIFO_STATUS, TRANS_STATUS, AUTO_CONF */
++static u32 hsi2c15_fail[5];
++
++static int hsi2c15_msg(bool read, u8 *buf, int len)
++{
++	int ret = hsi2c_msg(HSI2C15, TS_ADDR, read, buf, len);
++
++	if (ret) {
++		hsi2c15_fail[0] = readl(HSI2C_REG(0x00));
++		hsi2c15_fail[1] = readl(HSI2C_REG(0x24));
++		hsi2c15_fail[2] = readl(HSI2C_REG(0x30));
++		hsi2c15_fail[3] = readl(HSI2C_REG(0x50));
++		hsi2c15_fail[4] = readl(HSI2C_REG(0x44));
++		hsi2c_reset(HSI2C15);
++	}
++	return ret;
++}
++
++/* a register of the touch chip: its command byte written, then len bytes read (sec_ts_i2c_read) */
++static int ts_read(u8 cmd, u8 *buf, int len)
++{
++	int ret = hsi2c15_msg(false, &cmd, 1);
++
++	return ret ? ret : hsi2c15_msg(true, buf, len);
++}
++
++static int ts_command(u8 cmd)
++{
++	return hsi2c15_msg(false, &cmd, 1);
++}
++
++/*
++ * The display power chip S2DOS05 (I2C 0x60), reached the way S-BOOT reaches it: test 18 found its bus's controller
++ * (hsi2c4) still in reset and its pins GPP1-0 (SCL) and GPP1-1 (SDA) plain GPIO outputs, both high. So this drives
++ * those two pins by hand, open drain: a line is pulled low by making it an output at 0, and let go by making it an
++ * input (the SoC's own pull-up on, in case the board has none). About 50 kHz. bb_begin() saves the pins' CON, DAT and
++ * PUD and bb_end() puts them back as they were.
++ */
++#define GPP1_CON	0x10430020UL
++#define GPP1_DAT	0x10430024UL
++#define GPP1_PUD	0x10430028UL
++#define BB_SCL		0
++#define BB_SDA		1
++#define BB_US		10
++static u32 bb_saved[3];
++
++static void bb_set(int pin, int high)
++{
++	if (high) {
++		clrbits_le32(GPP1_CON, 0xf << (4 * pin));		/* input: let go */
++	} else {
++		clrbits_le32(GPP1_DAT, BIT(pin));
++		clrsetbits_le32(GPP1_CON, 0xf << (4 * pin), 1 << (4 * pin));	/* output, low */
++	}
++	udelay(BB_US);
++}
++
++static int bb_get(int pin)
++{
++	return (readl(GPP1_DAT) >> pin) & 1;
++}
++
++static void bb_scl_high(void)
++{
++	ulong t = get_timer(0);
++
++	bb_set(BB_SCL, 1);
++	while (!bb_get(BB_SCL) && get_timer(t) < 2)	/* a device holding the clock (stretching) */
++		;
++}
++
++static void bb_begin(void)
++{
++	bb_saved[0] = readl(GPP1_CON);
++	bb_saved[1] = readl(GPP1_DAT);
++	bb_saved[2] = readl(GPP1_PUD);
++	clrsetbits_le32(GPP1_PUD, 0xff, 0x33);			/* pull-ups on SCL, SDA */
++	bb_set(BB_SDA, 1);
++	bb_scl_high();
++}
++
++static void bb_end(void)
++{
++	writel(bb_saved[1], GPP1_DAT);
++	writel(bb_saved[0], GPP1_CON);
++	writel(bb_saved[2], GPP1_PUD);
++}
++
++static void bb_start(void)
++{
++	bb_set(BB_SDA, 1);
++	bb_scl_high();
++	bb_set(BB_SDA, 0);
++	bb_set(BB_SCL, 0);
++}
++
++static void bb_stop(void)
++{
++	bb_set(BB_SDA, 0);
++	bb_scl_high();
++	bb_set(BB_SDA, 1);
++}
++
++/* a byte out; 0 if the device acknowledged it */
++static int bb_out(u8 v)
++{
++	int i, nack;
++
++	for (i = 7; i >= 0; i--) {
++		bb_set(BB_SDA, (v >> i) & 1);
++		bb_scl_high();
++		bb_set(BB_SCL, 0);
++	}
++	bb_set(BB_SDA, 1);
++	bb_scl_high();
++	nack = bb_get(BB_SDA);
++	bb_set(BB_SCL, 0);
++	return nack;
++}
++
++static u8 bb_in(bool ack)
++{
++	u8 v = 0;
++	int i;
++
++	bb_set(BB_SDA, 1);
++	for (i = 0; i < 8; i++) {
++		bb_scl_high();
++		v = (v << 1) | bb_get(BB_SDA);
++		bb_set(BB_SCL, 0);
++	}
++	bb_set(BB_SDA, !ack);
++	bb_scl_high();
++	bb_set(BB_SCL, 0);
++	bb_set(BB_SDA, 1);
++	return v;
++}
++
++/* the display power chip S2DOS05: one register read (SMBus byte read: register, repeated start, a byte), or written */
++static int dos_read(u8 reg, u8 *val)
++{
++	int ret = -ENODEV;
++
++	bb_start();
++	if (!bb_out(DOS_ADDR << 1) && !bb_out(reg)) {
++		bb_start();
++		if (!bb_out((DOS_ADDR << 1) | 1)) {
++			*val = bb_in(false);
++			ret = 0;
++		}
++	}
++	bb_stop();
++	return ret;
++}
++
++static int dos_write(u8 reg, u8 val)
++{
++	int ret = -ENODEV;
++
++	bb_start();
++	if (!bb_out(DOS_ADDR << 1) && !bb_out(reg) && !bb_out(val))
++		ret = 0;
++	bb_stop();
++	return ret;
++}
++
++/*
++ * The touch chip's supplies, read only: the power chip's bus as S-BOOT left it (pins GPP1-0/1, its USI mode register
++ * usi@10421014, the controller), then, by hand on those pins (bb_*), the S2DOS05's ID (0x00), enables (0x03: bit 1
++ * LDO2 tsp_io, bit 2 LDO3 tsp_avdd) and the two LDOs' voltage (0x05, 0x06: 0x0C = 1.8 V and 3.0 V), each read twice
++ * (the two must agree). The pins are put back as they were.
++ */
++static int do_x1s_touchpower(struct cmd_tbl *cmdtp, int flag, int argc,
++			     char *const argv[])
++{
++	static const struct { const char *name; ulong addr; } regs[] = {
++		{ "GPP1 CON (pins 0,1: I2C=2)",	0x10430000UL + 0x20 },
++		{ "GPP1 DAT",			0x10430000UL + 0x24 },
++		{ "GPP1 PUD",			0x10430000UL + 0x28 },
++		{ "USI mode usi@10421014",	0x10421014UL },
++		{ "HSI2C4 CTL",			HSI2C4 + 0x00 },
++		{ "HSI2C4 CONF",		HSI2C4 + 0x40 },
++		{ "HSI2C4 TRANS_STATUS",	HSI2C4 + 0x50 },
++		{ "HSI2C4 TIMING_FS3",		HSI2C4 + 0x68 },
++		{ "HSI2C4 USI_CON (0: running)", HSI2C4 + 0xc4 },
++	};
++	static const struct { const char *name; u8 reg; } dos[] = {
++		{ "S2DOS05 DEV_ID", 0x00 }, { "S2DOS05 TOPSYS_STAT", 0x01 }, { "S2DOS05 STAT", 0x02 },
++		{ "S2DOS05 EN (bit1 tsp_io, bit2 tsp_avdd)", 0x03 },
++		{ "S2DOS05 LDO2_CFG (tsp_io, 0x0C=1.8V)", 0x05 }, { "S2DOS05 LDO3_CFG (tsp_avdd, 0x0C=3.0V)", 0x06 },
++	};
++	int i, ret, ret2;
++	u8 v, v2;
++
++	printf("Touch power check (read only):\n");
++	for (i = 0; i < ARRAY_SIZE(regs); i++)
++		usbcheck_line(regs[i].name, regs[i].addr);
++	bb_begin();
++	for (i = 0; i < ARRAY_SIZE(dos); i++) {
++		v = v2 = 0;
++		ret = dos_read(dos[i].reg, &v);
++		ret2 = dos_read(dos[i].reg, &v2);
++		printf("  %-40s %d %d, %02x %02x\n", dos[i].name, ret, ret2, v, v2);
++		video_sync_all();
++	}
++	bb_end();
++	printf("  GPP1 CON/DAT/PUD back to %08x %08x %08x\n", readl(GPP1_CON), readl(GPP1_DAT), readl(GPP1_PUD));
++	printf("done\n");
++	return CMD_RET_SUCCESS;
++}
++
++U_BOOT_CMD(touchpower, 1, 0, do_x1s_touchpower,
++	   "the touch chip's supplies on the display power chip, read only", "");
++
++static int do_x1s_touchtest(struct cmd_tbl *cmdtp, int flag, int argc,
++			    char *const argv[])
++{
++	u8 status = 0, id[5] = { 0 }, ev[16 * 8], en = 0, l2 = 0, l3 = 0;
++	ulong start;
++	int ret, i, shown = 0, events = 0;
++
++	printf("Touch test: 20 s. Touch the screen.\n");
++	video_sync_all();
++	/*
++	 * The supplies first (the owner's OK, 12 Nov): S2DOS05 EN (0x03) |= 0x06 (LDO2 tsp_io, LDO3 tsp_avdd), read-modify-
++	 * write, only if both voltages already read 0x0C (1.8 V, 3.0 V: the device tree's), and back as it was at the end.
++	 */
++	bb_begin();
++	if (dos_read(0x03, &en) || dos_read(0x05, &l2) || dos_read(0x06, &l3) ||
++	    dos_read(0x03, &status) || status != en) {
++		bb_end();
++		printf("  the power chip does not answer, or not the same twice: stopped\n");
++		return CMD_RET_FAILURE;
++	}
++	status = 0;
++	printf("  power chip: EN %02x, LDO2 %02x, LDO3 %02x\n", en, l2, l3);
++	if ((l2 & 0x7f) != 0x0c || (l3 & 0x7f) != 0x0c) {
++		bb_end();
++		printf("  the voltages are not 1.8 V and 3.0 V: nothing switched on, stopped\n");
++		return CMD_RET_FAILURE;
++	}
++	if ((en & 0x06) != 0x06) {
++		ret = dos_write(0x03, en | 0x06);
++		printf("  supplies on: %d (EN now %02x)\n", ret, dos_read(0x03, &status) ? 0xff : status);
++		status = 0;
++	} else {
++		printf("  supplies were already on\n");
++	}
++	bb_end();
++	mdelay(500);			/* the LDOs (50 us) and the chip's own start (sec_ts waits for it) */
++	video_sync_all();
++	clrsetbits_le32(0x10730000UL, 0xff << 24, 0x33 << 24);		/* GPP5-6/7: I2C */
++	clrbits_le32(0x10730008UL, 0xff << 24);				/* no pull */
++	clrbits_le32(0x15850028UL, 0xf);					/* GPA1-0: no pull-down */
++	printf("  USI mode 10721020 (hsi2c14) %08x, 10721024 (ours) %08x; USI_CON %08x\n",
++	       readl(0x10721020UL), readl(0x10721024UL), readl(HSI2C_REG(0xc4)));
++	/*
++	 * "touchtest usi" (menu 9, the owner's OK): our USI's mode register to I2C first, Samsung's usi_v2.c value
++	 * (I2C_SW_CONF = 4). Samsung's own device tree leaves this one disabled, so its default is what plain touchtest uses.
++	 */
++	if (argc > 1 && !strcmp(argv[1], "usi")) {
++		writel(4, 0x10721024UL);
++		printf("  USI mode 10721024 set to 4 (I2C): now %08x\n", readl(0x10721024UL));
++	}
++	writel(0, HSI2C_REG(0xc4));						/* USI_CON: out of reset */
++	hsi2c_reset(HSI2C15);
++	hsi2c_timing(HSI2C15, 200000000, 100000);
++	printf("  pins GPP5 %08x/%08x, GPA1 %08x; I2C USI_CON %08x CTL %08x CONF %08x FS1-3 %08x %08x %08x\n",
++	       readl(0x10730000UL), readl(0x10730008UL), readl(0x15850028UL), readl(HSI2C_REG(0xc4)),
++	       readl(HSI2C_REG(0x00)), readl(HSI2C_REG(0x40)), readl(HSI2C_REG(0x60)), readl(HSI2C_REG(0x64)),
++	       readl(HSI2C_REG(0x68)));
++	printf("  bus lines GPP5 DAT %08x (bits 6,7: SCL, SDA; high = idle, pulled up), IRQ line %d\n",
++	       readl(0x10730004UL), readl(0x15850024UL) & 1);
++	video_sync_all();
++	for (i = 0; i < 5; i++) {
++		ret = ts_read(0x55, &status, 1);
++		printf("  boot status (0x55), try %d: %d, %02x (0x20: running its firmware)\n", i + 1, ret, status);
++		if (ret)
++			printf("    failed with CTL %08x INT %08x FIFO %08x TRANS %08x AUTO %08x\n", hsi2c15_fail[0],
++			       hsi2c15_fail[1], hsi2c15_fail[2], hsi2c15_fail[3], hsi2c15_fail[4]);
++		video_sync_all();
++		if (!ret)
++			break;
++		mdelay(100);
++	}
++	ret = ts_read(0x22, id, 5);
++	printf("  device ID (0x22): %d, %02x %02x %02x %02x %02x\n", ret, id[0], id[1], id[2], id[3], id[4]);
++	video_sync_all();
++	if (ret) {
++		printf("  the chip does not answer: stopped (its power, or the bus)\n");
++		goto out;
++	}
++	printf("  clear events: %d, sense on: %d\n", ts_command(0x62), ts_command(0x10));
++	printf("  IRQ line now %d\n", readl(0x15850024UL) & 1);
++	video_sync_all();
++	start = get_timer(0);
++	while (get_timer(start) < 20000) {
++		int left;
++
++		schedule();
++		if (readl(0x15850024UL) & 1)		/* high: nothing waits */
++			continue;
++		if (ts_read(0x60, ev, 16))
++			continue;
++		left = ev[7] & 0x1f;
++		if (left > 7)
++			left = 7;
++		if (left && ts_read(0x61, ev + 16, 16 * left))
++			left = 0;
++		for (i = 0; i <= left; i++) {
++			const u8 *e = ev + 16 * i;
++			u32 x = (e[1] << 4) | (e[3] >> 4), y = (e[2] << 4) | (e[3] & 0xf);
++
++			events++;
++			if ((e[0] & 3) != 0 || shown >= 40)		/* coordinates only, and not too many lines */
++				continue;
++			shown++;
++			printf("  finger %d %s at %4u, %4u\n", (e[0] >> 2) & 0xf,
++			       ((e[0] >> 6) & 3) == 1 ? "down" : ((e[0] >> 6) & 3) == 3 ? "up  " : "move", x, y);
++			video_sync_all();
++		}
++	}
++	printf("  %d events; sense off: %d\n", events, ts_command(0x11));
++out:
++	if ((en & 0x06) != 0x06) {
++		bb_begin();
++		i = dos_write(0x03, en);
++		bb_end();
++		printf("  supplies back as they were: %d\n", i);
++	}
++	return ret ? CMD_RET_FAILURE : CMD_RET_SUCCESS;
++}
++
++U_BOOT_CMD(touchtest, 2, 0, do_x1s_touchtest,
++	   "the touch screen for 20 s, the fingers it reports on the screen", "[usi]: our USI mode register set to I2C first");
++
++/*
++ * USB as fastboot does it (the controller, the PHY, the fastboot gadget), for
++ * 20 s, with the PHY's and the controller's state on the screen every second:
++ * PMU USB20 PHY control (bit 0: not isolated), PHY UTMI and HSP, DWC3 DCTL
++ * (bit 31: run), DSTS (bits 18-21: link state, bit 22 DEVCTRLHLT), the event
++ * count, GUSB2PHYCFG. Then everything stopped again and back to the menu.
++ */
++static int do_x1s_usbtest(struct cmd_tbl *cmdtp, int flag, int argc,
++			  char *const argv[])
++{
++	struct udevice *udc;
++	ulong start;
++	int ret, sec = -1;
++
++	printf("USB test: 20 s\n");
++	video_sync_all();
++	ret = udc_device_get_by_index(0, &udc);
++	if (ret) {
++		printf("USB init failed: %d\n", ret);
++		return CMD_RET_FAILURE;
++	}
++	printf("controller up\n");
++	g_dnl_clear_detach();
++	ret = g_dnl_register("usb_dnl_fastboot");
++	printf("fastboot gadget: %d\n", ret);
++	printf("PMU72C %08x UTMI %08x HSP %08x U2PHYCFG %08x\n",
++	       readl(0x1586072cUL), readl(0x10c00050UL), readl(0x10c00054UL),
++	       readl(0x10e0c200UL));
++	printf(" s DCTL     DSTS     EVCNT    EVADRLO  EVADRHI  GCTL     DCFG     DEVTEN\n");
++	video_sync_all();
++	start = get_timer(0);
++	while (!ret && get_timer(start) < 20000) {
++		if ((int)(get_timer(start) / 1000) != sec) {
++			sec = get_timer(start) / 1000;
++			/* after 5 s with the run bit still off: set it here, and see whether it stays */
++			if (sec == 5 && !(readl(0x10e0c704UL) & BIT(31))) {
++				setbits_le32(0x10e0c704UL, BIT(31));
++				printf("run bit set by hand\n");
++			}
++			printf("%2d %08x %08x %08x %08x %08x %08x %08x %08x\n", sec,
++			       readl(0x10e0c704UL), readl(0x10e0c70cUL),
++			       readl(0x10e0c40cUL), readl(0x10e0c400UL),
++			       readl(0x10e0c404UL), readl(0x10e0c110UL),
++			       readl(0x10e0c700UL), readl(0x10e0c708UL));
++			video_sync_all();
++		}
++		schedule();
++		dm_usb_gadget_handle_interrupts(udc);
++	}
++	if (!ret)
++		g_dnl_unregister();
++	g_dnl_clear_detach();
++	udc_device_put(udc);
++	printf("USB stopped\n");
++	return CMD_RET_SUCCESS;
++}
++
++U_BOOT_CMD(usbtest, 1, 0, do_x1s_usbtest,
++	   "USB (fastboot) for 20 s with the PHY's and controller's state", "");
++
++/*
++ * Power off, Samsung's way (sec_reboot.c, sec_power_off() in the phone's own
++ * kernel): wait until the power key is let go (the power chip keeps the phone
++ * on while it is held), then PS_HOLD low: PMU PS_HOLD_CONTROL (0x1586030C)
++ * bit 8 cleared, and the power chip cuts the power. PSCI SYSTEM_OFF is tried
++ * first: on the test phone it came back. With a USB cable or a charger on, the
++ * power chip keeps the phone on (Samsung's kernel restarts into its charging
++ * screen then): the screen is made black, nothing lit, and the core waits.
++ */
++#define EXYNOS990_PMU_PS_HOLD_CONTROL	0x1586030CUL
++#define EXYNOS990_PS_HOLD_EN		BIT(8)
++#define EXYNOS990_GPA2_DAT		0x15850044UL	/* pinctrl ALIVE, gpa2 */
++#define EXYNOS990_POWER_KEY		BIT(4)		/* gpa2-4, low while pressed */
++#define EXYNOS990_FB			0xF1000000UL
++#define EXYNOS990_FB_SIZE		(1440 * 3200 * 4)
++
++static void __noreturn exynos_power_off(const char *why)
++{
++	struct pt_regs regs;
++	bool exynos990 = of_machine_is_compatible("samsung,exynos990");
++	int i;
++
++	printf("\n[x1s] %s: powering off\n", why);
++	if (exynos990) {
++		/* up to 10 s for the power key to be let go */
++		for (i = 0; i < 100 && !(readl(EXYNOS990_GPA2_DAT) &
++					 EXYNOS990_POWER_KEY); i++)
++			mdelay(100);
++	}
++	mdelay(1500);	/* long enough to read it */
++
++	if (exynos990) {
++		/*
++		 * The one write to the power chip, the one Samsung's kernel
++		 * makes before every power off: its restart features (WTSR,
++		 * SMPL) off. Without it the phone came straight back on
++		 * (tests 5 and 6); with it, it stayed off (test 7). The
++		 * owner's OK for every power off, the heat guard's too:
++		 * 11 Nov 2026. S-BOOT turns them on again at the next start.
++		 */
++		printf("[x1s] PMIC: WTSR/SMPL off: %d, SUB_SMPL off: %d\n",
++		       acpm_pmic_update(PMIC_BLOCK_RTC, PMIC_RTC_WTSR_SMPL, 0,
++					PMIC_WTSR_EN | PMIC_SMPL_EN),
++		       acpm_pmic_update(PMIC_BLOCK_RTC, PMIC_RTC_CAPSEL, 0,
++					PMIC_SUB_SMPL_EN));
++	}
++
++	if (exynos990) {
++		/*
++		 * Tell the APM first, as Samsung's kernel does
++		 * (exynos_acpm_reboot(): ACPM_IPC_PROTOCOL_STOP on the
++		 * framework's channel): without it the phone came straight
++		 * back on after PS_HOLD went low (test 5).
++		 */
++		u32 cmd[4] = { ACPM_PROTOCOL_STOP, 0, 0, 0 };
++
++		printf("[x1s] APM stop: %d\n", acpm_send(ACPM_CH_FRAMEWORK, cmd));
++	}
++
++	memset(&regs, 0, sizeof(regs));
++	regs.regs[0] = ARM_PSCI_0_2_FN_SYSTEM_OFF;
++	smc_call(&regs);
++
++	if (exynos990) {
++		clrbits_le32(EXYNOS990_PMU_PS_HOLD_CONTROL, EXYNOS990_PS_HOLD_EN);
++		mdelay(2000);
++		/* still here: the power chip keeps the phone on */
++		printf("[x1s] still on: a USB cable or charger keeps it on.\n");
++		printf("[x1s] Unplug it, or hold Volume Down + Power for 10 s.\n");
++		mdelay(8000);
++		memset((void *)EXYNOS990_FB, 0, EXYNOS990_FB_SIZE);
++		flush_dcache_range(EXYNOS990_FB,
++				   EXYNOS990_FB + EXYNOS990_FB_SIZE);
++	} else {
++		printf("[x1s] power off failed: hold Volume Down + Power for 10 s\n");
++	}
++	for (;;)
++		asm volatile("wfi");
++}
++
++#if !CONFIG_IS_ENABLED(SYSRESET_CMD_POWEROFF)
++/* the poweroff command, where no driver provides one: PSCI SYSTEM_OFF */
++int do_poweroff(struct cmd_tbl *cmdtp, int flag, int argc, char *const argv[])
++{
++	exynos_power_off("poweroff");
++}
++#endif
++
++
++static void heat_guard_check(struct cyclic_info *c)
++{
++	ulong ms = get_timer(heat_guard_start);
++
++	if (!heat_guard_warned && ms + 60 * 1000 >= heat_guard_limit_ms) {
++		heat_guard_warned = true;
++		printf("\n[x1s] time limit (not heat): powering off in 1 minute; CPU %d C\n",
++		       exynos990_cpu_temp());
++	}
++	if (ms >= heat_guard_limit_ms)
++		exynos_power_off("time limit (hakios_max_minutes) reached");
++
++	/* the temperature, every 2 s: 70 C on any CPU zone is the end of the run */
++	if (ms / 2000 != heat_guard_last_read) {
++		int t = exynos990_cpu_temp();
++
++		heat_guard_last_read = ms / 2000;
++		if (t >= HEAT_GUARD_MAX_C) {
++			printf("\n[x1s] heat guard: %d C\n", t);
++			exynos_power_off("heat guard: too hot");
++		}
++	}
++}
++
++static void exynos990_heat_guard_start(void)
++{
++	ulong minutes = env_get_ulong("hakios_max_minutes", 10,
++				      HEAT_GUARD_DEFAULT_MINUTES);
++
++	if (!minutes || minutes > 60)
++		minutes = HEAT_GUARD_DEFAULT_MINUTES;
++	heat_guard_start = get_timer(0);
++	heat_guard_limit_ms = minutes * 60 * 1000;
++	cyclic_register(&heat_guard, heat_guard_check, 1000 * 1000,
++			"heat-guard");
++	printf("[x1s] heat guard: power off after %lu minutes or at %d C\n",
++	       minutes, HEAT_GUARD_MAX_C);
++	{
++		int t = exynos990_cpu_temp();
++
++		if (t < 0)
++			printf("[x1s] temperature: no answer from the APM (%d): the time limit only\n", t);
++		else
++			printf("[x1s] temperature: %d C (hottest CPU zone)\n", t);
++	}
++}
++
++/*
++ * Core test (12 Nov). HakiOS's loader gets "yes" (0) from PSCI CPU_ON and AFFINITY_INFO "off", and no core runs.
++ * TWRP's Linux started through this U-Boot (booti, kernel at 0x8c080000) gets cores 0 and 4-7, not 1-3; iOS's
++ * kernel (high in RAM) gets none. So: does the place a core starts at matter? A tiny stub (its MPIDR into its own
++ * page at +0x100 + 8 * Affinity1, then CPU_OFF) in a page high in RAM (U-Boot's heap) or low (0x8c080000, where
++ * Linux ran). Early (board_init): core 4 high, core 5 low. "cores": core 4 low, core 5 high, core 1 low.
++ * Results in the environment, read over fastboot with "oem run:test ...": x1s_<e|l><core><h|l> =
++ * "<CPU_ON> <AFFINITY now> <AFFINITY after 200 ms> <seen MPIDR|1>".
++ */
++void x1s_core_stub(void);
++void x1s_core_stub_end(void);
++asm(".pushsection .text.x1s_core_stub, \"ax\"\n"
++    ".balign 64\n"
++    ".globl x1s_core_stub\n"
++    "x1s_core_stub:\n"
++    "  msr daifset, #0xf\n"
++    "  mrs x1, mpidr_el1\n"
++    "  adr x2, x1s_core_stub\n"
++    "  add x2, x2, #0x100\n"
++    "  ubfx x3, x1, #8, #3\n"
++    "  add x2, x2, x3, lsl #3\n"
++    "  orr x1, x1, #1\n"
++    "  str x1, [x2]\n"
++    "  dsb sy\n"
++    "  mov x0, #2\n"
++    "  movk x0, #0x8400, lsl #16\n"
++    "  hvc #0\n"
++    "1: wfi\n"
++    "  b 1b\n"
++    ".globl x1s_core_stub_end\n"
++    "x1s_core_stub_end:\n"
++    ".popsection\n");
++
++static s64 x1s_hvc(u64 fn, u64 a1, u64 a2, u64 a3)
++{
++	register u64 x0 asm("x0") = fn;
++	register u64 x1 asm("x1") = a1;
++	register u64 x2 asm("x2") = a2;
++	register u64 x3 asm("x3") = a3;
++
++	asm volatile("hvc #0" : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3) : :
++		     "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "memory");
++	return (s64)x0;
++}
++
++#define X1S_LOW_PAGE	0x8c080000UL
++
++static void x1s_core_try(int core, ulong page, s64 res[4])
++{
++	ulong n = (ulong)x1s_core_stub_end - (ulong)x1s_core_stub, start;
++	volatile u64 *marks = (volatile u64 *)(page + 0x100);
++
++	memset((void *)page, 0, 0x200);
++	memcpy((void *)page, (void *)x1s_core_stub, n);
++	flush_dcache_range(page, page + 0x200);
++	invalidate_icache_all();
++	res[0] = x1s_hvc(0xC4000003, core, page, 0);
++	res[1] = x1s_hvc(0xC4000004, core, 0, 0);
++	start = get_timer(0);
++	while (get_timer(start) < 200) {
++		invalidate_dcache_range(page + 0x100, page + 0x140);
++		if (marks[core])
++			break;
++	}
++	res[2] = x1s_hvc(0xC4000004, core, 0, 0);
++	invalidate_dcache_range(page + 0x100, page + 0x140);
++	res[3] = marks[core];
++}
++
++static void x1s_core_publish(const char *name, s64 res[4])
++{
++	char val[80];
++
++	snprintf(val, sizeof(val), "%lld %lld %lld %llx", res[0], res[1], res[2], res[3]);
++	env_set(name, val);
++	printf("[x1s] %s: CPU_ON %lld, AFFINITY now %lld, later %lld, seen %llx\n", name, res[0], res[1], res[2],
++	       res[3]);
++}
++
++
++static int do_x1s_cores(struct cmd_tbl *cmdtp, int flag, int argc, char *const argv[])
++{
++	s64 res[4][4] = { 0 };
++	void *high = memalign(4096, 4096);
++
++	if (!high)
++		return CMD_RET_FAILURE;
++	x1s_core_try(4, X1S_LOW_PAGE, res[0]);
++	x1s_core_try(5, X1S_LOW_PAGE, res[1]);
++	x1s_core_try(1, X1S_LOW_PAGE, res[2]);
++	free(high);
++	x1s_core_publish("x1s_l4l", res[0]);
++	x1s_core_publish("x1s_l5l", res[1]);
++	x1s_core_publish("x1s_l1l", res[2]);
++	return CMD_RET_SUCCESS;
++}
++
++U_BOOT_CMD(cores, 1, 0, do_x1s_cores,
++	   "start cores 4, 5 and 1 for a moment (PSCI by HVC), from low and high RAM, and say whether they ran", "");
++
+ int board_init(void)
+ {
++	if (of_machine_is_compatible("samsung,exynos990"))
++		exynos990_screen_init();
++	mark_stage(3, 0xff000080);
++
+ 	return 0;
+ }
+ 
+@@ -364,9 +1975,38 @@ int misc_init_r(void)
+ 
+ 	exynos_env_setup();
+ 
+-	ret = exynos_blk_env_setup();
++	if (of_machine_is_compatible("samsung,exynos990")) {
++		const char *bootargs = exynos_prev_bl_get_bootargs();
++
++		/*
++		 * A charger plugged into a phone that was off: S-BOOT starts
++		 * boot.img in its charging mode. No menu then, and no power
++		 * off (the charger would keep the phone on, and S-BOOT start
++		 * us again): a black screen and a core that waits, while the
++		 * power chip charges the battery by itself.
++		 */
++		if (bootargs && (strstr(bootargs, "androidboot.mode=charger") ||
++				 strstr(bootargs, "lpcharge=1"))) {
++			memset((void *)EXYNOS990_FB, 0, EXYNOS990_FB_SIZE);
++			flush_dcache_range(EXYNOS990_FB,
++					   EXYNOS990_FB + EXYNOS990_FB_SIZE);
++			for (;;)
++				asm volatile("wfi");
++		}
++		exynos990_heat_guard_start();
++	}
++	mark_stage(4, 0xff606060);
++
++	/*
++	 * Phones with UFS (the Exynos990's) have no mmc device in U-Boot yet:
++	 * then there is nothing to map or flash, and U-Boot goes on without
++	 * (fastboot still takes downloads into its buffer).
++	 */
++	exynos_blk_env_setup();
++
++	ret = exynos_fastboot_setup();
+ 	if (ret)
+-		return ret;
++		log_warning("%s: fastboot setup failed (%d)\n", __func__, ret);
+ 
+-	return exynos_fastboot_setup();
++	return 0;
+ }
+diff --git a/cmd/Kconfig b/cmd/Kconfig
+index 02ed027c..fffe0140 100644
+--- a/cmd/Kconfig
++++ b/cmd/Kconfig
+@@ -483,6 +483,16 @@ config CMD_HAKIOS
+ 	  ramdisk the previous bootloader loaded, or from anywhere in RAM, put
+ 	  the payload where the loader looks for it and start the loader.
+ 
++config HAKIOS_PAYLOAD_BASE
++	hex "Where the hakios command puts the loader's payload"
++	depends on CMD_HAKIOS
++	default 0xF0000000
++	help
++	  The physical address of the 64 MiB the HakiOS loader looks in for
++	  its payload. It must match the phone's platform entry in the
++	  loader (xnuloader/loader.c) and a reserved-memory node of the
++	  device tree. Qualcomm phones use 0xF0000000.
++
+ config CMD_BOOTEFI
+ 	bool "bootefi"
+ 	depends on EFI_LOADER
+diff --git a/cmd/hakios.c b/cmd/hakios.c
+index edf2afa0..8a43db99 100644
+--- a/cmd/hakios.c
++++ b/cmd/hakios.c
+@@ -38,7 +38,7 @@
+ #include <linux/sizes.h>
+ #include <linux/string.h>
+ 
+-#define PAYLOAD_BASE		0xF0000000UL
++#define PAYLOAD_BASE		((ulong)CONFIG_HAKIOS_PAYLOAD_BASE)	/* 0xF0000000 on Qualcomm phones */
+ #define PAYLOAD_MAX		(SZ_64M - SZ_1M)	/* the last MiB of the 64 is the kernel's panic log */
+ #define XNUP_MAGIC		0x50554E58		/* "XNUP" */
+ #define HKUB_MAGIC		0x42554B48		/* "HKUB" */
+@@ -149,7 +149,7 @@ static int take_payload(const void *data, ulong size)
+ 		return -E2BIG;
+ 	}
+ 	/*
+-	 * The device tree keeps PAYLOAD_BASE reserved (hakios-payload@f0000000), so this succeeds only on a U-Boot
++	 * The device tree keeps PAYLOAD_BASE reserved (hakios-payload@...), so this succeeds only on a U-Boot
+ 	 * that does not: then nothing else took it either.
+ 	 */
+ 	lmb_alloc_mem(LMB_MEM_ALLOC_ADDR, 0, &addr, SZ_64M, LMB_NONE);
+diff --git a/common/board_f.c b/common/board_f.c
+index ce87c619..87cc49c9 100644
+--- a/common/board_f.c
++++ b/common/board_f.c
+@@ -305,6 +305,10 @@ __weak int mach_cpu_init(void)
+ 	return 0;
+ }
+ 
++__weak void board_initcall_mark(const char *seq, const char *name, int ret)
++{
++}
++
+ /* Get the top of usable RAM */
+ __weak phys_addr_t board_get_usable_ram_top(phys_size_t total_size)
+ {
+diff --git a/drivers/phy/phy-exynos-usbdrd.c b/drivers/phy/phy-exynos-usbdrd.c
+index c5eed29a..e66d8577 100644
+--- a/drivers/phy/phy-exynos-usbdrd.c
++++ b/drivers/phy/phy-exynos-usbdrd.c
+@@ -22,6 +22,8 @@
+ #define EXYNOS_USBDRD_PHY_CONTROL		0x0704
+ #define EXYNOS_PHY_ENABLE			BIT(0)
+ #define EXYNOS7870_PHY_ENABLE			BIT(1)
++/* Exynos990: the USB 2.0 PHY's isolation is at another PMU offset (Linux: EXYNOS990_PHY_CTRL_USB20) */
++#define EXYNOS990_USBDRD_PHY_CONTROL		0x072c
+ 
+ /* Exynos USB PHY registers */
+ #define EXYNOS5_FSEL_9MHZ6			0x0
+@@ -143,6 +145,12 @@
+ #define HSP_VBUSVLDEXTSEL			BIT(13)
+ #define HSP_FSV_OUT_EN				BIT(24)
+ 
++#define EXYNOS850_DRD_HSPPARACON		0x58
++#define HSPPARACON_TXVREF			GENMASK(31, 28)
++#define HSPPARACON_TXPREEMPAMP			GENMASK(19, 18)
++#define HSPPARACON_SQRX				GENMASK(10, 8)
++#define HSPPARACON_COMPDIS			GENMASK(2, 0)
++
+ #define EXYNOS850_DRD_HSP_TEST			0x5c
+ #define HSP_TEST_SIDDQ				BIT(24)
+ 
+@@ -152,6 +160,7 @@
+ enum exynos_usbdrd_phy_variant {
+ 	EXYNOS7870_USBDRD_PHY,
+ 	EXYNOS850_USBDRD_PHY,
++	EXYNOS990_USBDRD_PHY,	/* Exynos850's PHY with Exynos990's tuning and PMU offset */
+ };
+ 
+ /**
+@@ -184,7 +193,9 @@ static void exynos_usbdrd_phy_isol(struct exynos_usbdrd_phy *phy_drd,
+ 		mask = EXYNOS7870_PHY_ENABLE;
+ 
+ 	val = isolate ? 0 : mask;
+-	regmap_update_bits(phy_drd->reg_pmu, EXYNOS_USBDRD_PHY_CONTROL,
++	regmap_update_bits(phy_drd->reg_pmu,
++			   phy_drd->variant == EXYNOS990_USBDRD_PHY ?
++			   EXYNOS990_USBDRD_PHY_CONTROL : EXYNOS_USBDRD_PHY_CONTROL,
+ 			   mask, val);
+ }
+ 
+@@ -418,6 +429,23 @@ static void exynos850_usbdrd_utmi_init(struct phy *phy)
+ 	writel(reg, regs_base + EXYNOS850_DRD_HSP);
+ }
+ 
++/* Exynos990's high-speed tuning, after the Exynos850 init (Linux: exynos990_tunes_utmi_postinit) */
++static void exynos990_usbdrd_utmi_tune(struct phy *phy)
++{
++	struct exynos_usbdrd_phy *phy_drd = dev_get_priv(phy->dev);
++	void __iomem *regs_base = phy_drd->reg_phy;
++	u32 reg;
++
++	reg = readl(regs_base + EXYNOS850_DRD_HSPPARACON);
++	reg &= ~(HSPPARACON_TXVREF | HSPPARACON_TXPREEMPAMP | HSPPARACON_SQRX |
++		 HSPPARACON_COMPDIS);
++	reg |= FIELD_PREP(HSPPARACON_TXVREF, 7) |
++	       FIELD_PREP(HSPPARACON_TXPREEMPAMP, 3) |
++	       FIELD_PREP(HSPPARACON_SQRX, 5) |
++	       FIELD_PREP(HSPPARACON_COMPDIS, 7);
++	writel(reg, regs_base + EXYNOS850_DRD_HSPPARACON);
++}
++
+ static void exynos7870_usbdrd_utmi_exit(struct phy *phy)
+ {
+ 	struct exynos_usbdrd_phy *phy_drd = dev_get_priv(phy->dev);
+@@ -487,6 +515,10 @@ static int exynos_usbdrd_phy_init(struct phy *phy)
+ 	case EXYNOS850_USBDRD_PHY:
+ 		exynos850_usbdrd_utmi_init(phy);
+ 		break;
++	case EXYNOS990_USBDRD_PHY:
++		exynos850_usbdrd_utmi_init(phy);
++		exynos990_usbdrd_utmi_tune(phy);
++		break;
+ 	default:
+ 		dev_err(phy->dev, "Failed to recognize phy variant\n");
+ 	}
+@@ -510,6 +542,7 @@ static int exynos_usbdrd_phy_exit(struct phy *phy)
+ 		exynos7870_usbdrd_utmi_exit(phy);
+ 		break;
+ 	case EXYNOS850_USBDRD_PHY:
++	case EXYNOS990_USBDRD_PHY:
+ 		exynos850_usbdrd_utmi_exit(phy);
+ 		break;
+ 	default:
+@@ -624,6 +657,10 @@ static const struct udevice_id exynos_usbdrd_phy_of_match[] = {
+ 		.compatible = "samsung,exynos850-usbdrd-phy",
+ 		.data = EXYNOS850_USBDRD_PHY,
+ 	},
++	{
++		.compatible = "samsung,exynos990-usbdrd-phy",
++		.data = EXYNOS990_USBDRD_PHY,
++	},
+ 	{ }
+ };
+ 
+diff --git a/drivers/pinctrl/exynos/Kconfig b/drivers/pinctrl/exynos/Kconfig
+index 1b7fb62b..918151a5 100644
+--- a/drivers/pinctrl/exynos/Kconfig
++++ b/drivers/pinctrl/exynos/Kconfig
+@@ -24,3 +24,11 @@ config PINCTRL_EXYNOS850
+ 	help
+ 	  Support pin multiplexing and pin configuration control on
+ 	  Samsung's Exynos850 SoC.
++
++config PINCTRL_EXYNOS990
++	bool "Samsung Exynos990 pinctrl driver"
++	depends on ARCH_EXYNOS && PINCTRL_FULL
++	select PINCTRL_EXYNOS
++	help
++	  Support pin multiplexing and pin configuration control on
++	  Samsung's Exynos990 SoC (the Galaxy S20 and Note20 phones).
+diff --git a/drivers/pinctrl/exynos/Makefile b/drivers/pinctrl/exynos/Makefile
+index 3abe1226..af9f3d16 100644
+--- a/drivers/pinctrl/exynos/Makefile
++++ b/drivers/pinctrl/exynos/Makefile
+@@ -7,3 +7,4 @@ obj-$(CONFIG_PINCTRL_EXYNOS)		+= pinctrl-exynos.o
+ obj-$(CONFIG_PINCTRL_EXYNOS7420)	+= pinctrl-exynos7420.o
+ obj-$(CONFIG_PINCTRL_EXYNOS78x0)	+= pinctrl-exynos78x0.o
+ obj-$(CONFIG_PINCTRL_EXYNOS850)		+= pinctrl-exynos850.o
++obj-$(CONFIG_PINCTRL_EXYNOS990)		+= pinctrl-exynos990.o
+diff --git a/drivers/pinctrl/exynos/pinctrl-exynos990.c b/drivers/pinctrl/exynos/pinctrl-exynos990.c
+new file mode 100644
+index 00000000..1612a772
+--- /dev/null
++++ b/drivers/pinctrl/exynos/pinctrl-exynos990.c
+@@ -0,0 +1,161 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Exynos990 pinctrl driver, for HakiOS's U-Boot on the Galaxy S20 family.
++ *
++ * The banks are Linux's (drivers/pinctrl/samsung/pinctrl-exynos-arm64.c, exynos990_pin_ctrl); the register layout
++ * is the Exynos850's (CON, DAT, PUD, DRV of 4, 1, 4, 4 bits, a bank every 0x20 bytes).
++ */
++
++#include <dm.h>
++#include <dm/pinctrl.h>
++#include "pinctrl-exynos.h"
++
++#define EXYNOS990_PIN_BANK(pins, reg, id)		\
++	{						\
++		.type		= &exynos990_bank_type,	\
++		.offset		= reg,			\
++		.nr_pins	= pins,			\
++		.name		= id			\
++	}
++
++/* CON, DAT, PUD, DRV */
++static const struct samsung_pin_bank_type exynos990_bank_type = {
++	.fld_width = { 4, 1, 4, 4, },
++	.reg_offset = { 0x00, 0x04, 0x08, 0x0c, },
++};
++
++static const struct pinctrl_ops exynos990_pinctrl_ops = {
++	.set_state = exynos_pinctrl_set_state
++};
++
++/* pin-controller 0 (ALIVE): the keys */
++static const struct samsung_pin_bank_data exynos990_pin_banks0[] = {
++	EXYNOS990_PIN_BANK(8, 0x000, "gpa0"),
++	EXYNOS990_PIN_BANK(8, 0x020, "gpa1"),
++	EXYNOS990_PIN_BANK(8, 0x040, "gpa2"),
++	EXYNOS990_PIN_BANK(8, 0x060, "gpa3"),
++	EXYNOS990_PIN_BANK(2, 0x080, "gpa4"),
++	EXYNOS990_PIN_BANK(7, 0x0a0, "gpq0"),
++};
++
++/* pin-controller 1 (CMGP) */
++static const struct samsung_pin_bank_data exynos990_pin_banks1[] = {
++	EXYNOS990_PIN_BANK(1, 0x000, "gpm0"),
++	EXYNOS990_PIN_BANK(1, 0x020, "gpm1"),
++	EXYNOS990_PIN_BANK(1, 0x040, "gpm2"),
++	EXYNOS990_PIN_BANK(1, 0x060, "gpm3"),
++	EXYNOS990_PIN_BANK(1, 0x080, "gpm4"),
++	EXYNOS990_PIN_BANK(1, 0x0a0, "gpm5"),
++	EXYNOS990_PIN_BANK(1, 0x0c0, "gpm6"),
++	EXYNOS990_PIN_BANK(1, 0x0e0, "gpm7"),
++	EXYNOS990_PIN_BANK(1, 0x100, "gpm8"),
++	EXYNOS990_PIN_BANK(1, 0x120, "gpm9"),
++	EXYNOS990_PIN_BANK(1, 0x140, "gpm10"),
++	EXYNOS990_PIN_BANK(1, 0x160, "gpm11"),
++	EXYNOS990_PIN_BANK(1, 0x180, "gpm12"),
++	EXYNOS990_PIN_BANK(1, 0x1a0, "gpm13"),
++	EXYNOS990_PIN_BANK(1, 0x1c0, "gpm14"),
++	EXYNOS990_PIN_BANK(1, 0x1e0, "gpm15"),
++	EXYNOS990_PIN_BANK(1, 0x200, "gpm16"),
++	EXYNOS990_PIN_BANK(1, 0x220, "gpm17"),
++	EXYNOS990_PIN_BANK(1, 0x240, "gpm18"),
++	EXYNOS990_PIN_BANK(1, 0x260, "gpm19"),
++	EXYNOS990_PIN_BANK(1, 0x280, "gpm20"),
++	EXYNOS990_PIN_BANK(1, 0x2a0, "gpm21"),
++	EXYNOS990_PIN_BANK(1, 0x2c0, "gpm22"),
++	EXYNOS990_PIN_BANK(1, 0x2e0, "gpm23"),
++	EXYNOS990_PIN_BANK(1, 0x300, "gpm24"),
++	EXYNOS990_PIN_BANK(1, 0x320, "gpm25"),
++	EXYNOS990_PIN_BANK(1, 0x340, "gpm26"),
++	EXYNOS990_PIN_BANK(1, 0x360, "gpm27"),
++	EXYNOS990_PIN_BANK(1, 0x380, "gpm28"),
++	EXYNOS990_PIN_BANK(1, 0x3a0, "gpm29"),
++	EXYNOS990_PIN_BANK(1, 0x3c0, "gpm30"),
++	EXYNOS990_PIN_BANK(1, 0x3e0, "gpm31"),
++	EXYNOS990_PIN_BANK(1, 0x400, "gpm32"),
++	EXYNOS990_PIN_BANK(1, 0x420, "gpm33"),
++};
++
++/* pin-controller 2 (HSI1) */
++static const struct samsung_pin_bank_data exynos990_pin_banks2[] = {
++	EXYNOS990_PIN_BANK(4, 0x000, "gpf0"),
++	EXYNOS990_PIN_BANK(6, 0x020, "gpf1"),
++	EXYNOS990_PIN_BANK(3, 0x040, "gpf2"),
++};
++
++/* pin-controller 3 (HSI2) */
++static const struct samsung_pin_bank_data exynos990_pin_banks3[] = {
++	EXYNOS990_PIN_BANK(2, 0x000, "gpf3"),
++};
++
++/* pin-controller 4 (PERIC0) */
++static const struct samsung_pin_bank_data exynos990_pin_banks4[] = {
++	EXYNOS990_PIN_BANK(8, 0x000, "gpp0"),
++	EXYNOS990_PIN_BANK(8, 0x020, "gpp1"),
++	EXYNOS990_PIN_BANK(8, 0x040, "gpp2"),
++	EXYNOS990_PIN_BANK(8, 0x060, "gpp3"),
++	EXYNOS990_PIN_BANK(8, 0x080, "gpp4"),
++	EXYNOS990_PIN_BANK(2, 0x0a0, "gpg0"),
++};
++
++/* pin-controller 5 (PERIC1) */
++static const struct samsung_pin_bank_data exynos990_pin_banks5[] = {
++	EXYNOS990_PIN_BANK(8, 0x000, "gpp5"),
++	EXYNOS990_PIN_BANK(8, 0x020, "gpp6"),
++	EXYNOS990_PIN_BANK(8, 0x040, "gpp7"),
++	EXYNOS990_PIN_BANK(8, 0x060, "gpp8"),
++	EXYNOS990_PIN_BANK(8, 0x080, "gpp9"),
++	EXYNOS990_PIN_BANK(6, 0x0a0, "gpc0"),
++	EXYNOS990_PIN_BANK(4, 0x0c0, "gpg1"),
++	EXYNOS990_PIN_BANK(8, 0x0e0, "gpb0"),
++	EXYNOS990_PIN_BANK(8, 0x100, "gpb1"),
++	EXYNOS990_PIN_BANK(8, 0x120, "gpb2"),
++};
++
++/* pin-controller 6 (VTS) */
++static const struct samsung_pin_bank_data exynos990_pin_banks6[] = {
++	EXYNOS990_PIN_BANK(7, 0x000, "gpv0"),
++};
++
++/* in the order of the pinctrlN aliases of exynos990.dtsi */
++static const struct samsung_pin_ctrl exynos990_pin_ctrl[] = {
++	{
++		.pin_banks	= exynos990_pin_banks0,
++		.nr_banks	= ARRAY_SIZE(exynos990_pin_banks0),
++	}, {
++		.pin_banks	= exynos990_pin_banks1,
++		.nr_banks	= ARRAY_SIZE(exynos990_pin_banks1),
++	}, {
++		.pin_banks	= exynos990_pin_banks2,
++		.nr_banks	= ARRAY_SIZE(exynos990_pin_banks2),
++	}, {
++		.pin_banks	= exynos990_pin_banks3,
++		.nr_banks	= ARRAY_SIZE(exynos990_pin_banks3),
++	}, {
++		.pin_banks	= exynos990_pin_banks4,
++		.nr_banks	= ARRAY_SIZE(exynos990_pin_banks4),
++	}, {
++		.pin_banks	= exynos990_pin_banks5,
++		.nr_banks	= ARRAY_SIZE(exynos990_pin_banks5),
++	}, {
++		.pin_banks	= exynos990_pin_banks6,
++		.nr_banks	= ARRAY_SIZE(exynos990_pin_banks6),
++	},
++	{ /* list terminator */ }
++};
++
++static const struct udevice_id exynos990_pinctrl_ids[] = {
++	{ .compatible = "samsung,exynos990-pinctrl",
++		.data = (ulong)exynos990_pin_ctrl },
++	{ }
++};
++
++U_BOOT_DRIVER(pinctrl_exynos990) = {
++	.name		= "pinctrl_exynos990",
++	.id		= UCLASS_PINCTRL,
++	.of_match	= exynos990_pinctrl_ids,
++	.priv_auto	= sizeof(struct exynos_pinctrl_priv),
++	.ops		= &exynos990_pinctrl_ops,
++	.probe		= exynos_pinctrl_probe,
++	.bind		= exynos_pinctrl_bind,
++};
+diff --git a/drivers/usb/dwc3/core.c b/drivers/usb/dwc3/core.c
+index be198041..70500e4b 100644
+--- a/drivers/usb/dwc3/core.c
++++ b/drivers/usb/dwc3/core.c
+@@ -120,7 +120,7 @@ static void dwc3_frame_length_adjustment(struct dwc3 *dwc, u32 fladj)
+ {
+ 	u32 reg;
+ 
+-	if (dwc->revision < DWC3_REVISION_250A)
++	if (DWC3_REV_LT(DWC3_REVISION_250A))
+ 		return;
+ 
+ 	if (fladj == 0)
+@@ -163,7 +163,7 @@ static void dwc3_ref_clk_period(struct dwc3 *dwc)
+ 	reg |=  FIELD_PREP(DWC3_GUCTL_REFCLKPER_MASK, period);
+ 	dwc3_writel(dwc->regs, DWC3_GUCTL, reg);
+ 
+-	if (dwc->revision <= DWC3_REVISION_250A)
++	if (DWC3_REV_LE(DWC3_REVISION_250A))
+ 		return;
+ 
+ 	/*
+@@ -488,7 +488,7 @@ static void dwc3_phy_setup(struct dwc3 *dwc)
+ 	 * will be '0' when the core is reset. Application needs to set it
+ 	 * to '1' after the core initialization is completed.
+ 	 */
+-	if (dwc->revision > DWC3_REVISION_194A)
++	if (DWC3_REV_GT(DWC3_REVISION_194A))
+ 		reg |= DWC3_GUSB3PIPECTL_SUSPHY;
+ 
+ 	if (dwc->u2ss_inp3_quirk)
+@@ -532,7 +532,7 @@ static void dwc3_phy_setup(struct dwc3 *dwc)
+ 	 * be '0' when the core is reset. Application needs to set it to
+ 	 * '1' after the core initialization is completed.
+ 	 */
+-	if (dwc->revision > DWC3_REVISION_194A)
++	if (DWC3_REV_GT(DWC3_REVISION_194A))
+ 		reg |= DWC3_GUSB2PHYCFG_SUSPHY;
+ 
+ 	if (dwc->dis_u2_susphy_quirk)
+@@ -677,8 +677,8 @@ static int dwc3_core_init(struct dwc3 *dwc)
+ 		 */
+ 		if ((dwc->dr_mode == USB_DR_MODE_HOST ||
+ 				dwc->dr_mode == USB_DR_MODE_OTG) &&
+-				(dwc->revision >= DWC3_REVISION_210A &&
+-				dwc->revision <= DWC3_REVISION_250A))
++				(DWC3_REV_GE(DWC3_REVISION_210A) &&
++				DWC3_REV_LE(DWC3_REVISION_250A)))
+ 			reg |= DWC3_GCTL_DSBLCLKGTNG | DWC3_GCTL_SOFITPSYNC;
+ 		else
+ 			reg &= ~DWC3_GCTL_DSBLCLKGTNG;
+@@ -721,7 +721,7 @@ static int dwc3_core_init(struct dwc3 *dwc)
+ 	 * and falls back to high-speed mode which causes
+ 	 * the device to enter a Connect/Disconnect loop
+ 	 */
+-	if (dwc->revision < DWC3_REVISION_190A)
++	if (DWC3_REV_LT(DWC3_REVISION_190A))
+ 		reg |= DWC3_GCTL_U2RSTECN;
+ 
+ 	dwc3_core_num_eps(dwc);
+@@ -1202,14 +1202,14 @@ int dwc3_init(struct dwc3 *dwc)
+ 		goto event_fail;
+ 	}
+ 
+-	if (dwc->revision >= DWC3_REVISION_250A) {
++	if (DWC3_REV_GE(DWC3_REVISION_250A)) {
+ 		reg = dwc3_readl(dwc->regs, DWC3_GUCTL1);
+ 
+ 		/*
+ 		 * Enable hardware control of sending remote wakeup
+ 		 * in HS when the device is in the L1 state.
+ 		 */
+-		if (dwc->revision >= DWC3_REVISION_290A)
++		if (DWC3_REV_GE(DWC3_REVISION_290A))
+ 			reg |= DWC3_GUCTL1_DEV_L1_EXIT_BY_HW;
+ 
+ 		if (dwc->dis_tx_ipgap_linecheck_quirk)
+diff --git a/drivers/usb/dwc3/core.h b/drivers/usb/dwc3/core.h
+index cdbfdce7..d064eb8f 100644
+--- a/drivers/usb/dwc3/core.h
++++ b/drivers/usb/dwc3/core.h
+@@ -1104,6 +1104,19 @@ void dwc3_remove(struct dwc3 *dwc);
+ #define DWC3_IP_IS(_ip)							\
+ 	(dwc->ip == _ip##_IP)
+ 
++/*
++ * Comparisons with the DWC_usb3 revisions (DWC3_REVISION_xxx, "U3" and a
++ * number). A DWC_usb31 or DWC_usb32 keeps its revision in another numbering
++ * (VER_NUMBER, e.g. 0x3131302a for 1.10a) that compares below every one of
++ * them: such a core is newer than any DWC_usb3, as Linux takes it. Without
++ * this the Exynos990's DWC_usb31 got the old cores' workarounds (SuperSpeed
++ * forced, the old run/stop sequence) and never came up on the bus.
++ */
++#define DWC3_REV_LT(_rev)	(DWC3_IP_IS(DWC3) && dwc->revision < (_rev))
++#define DWC3_REV_LE(_rev)	(DWC3_IP_IS(DWC3) && dwc->revision <= (_rev))
++#define DWC3_REV_GT(_rev)	(!DWC3_IP_IS(DWC3) || dwc->revision > (_rev))
++#define DWC3_REV_GE(_rev)	(!DWC3_IP_IS(DWC3) || dwc->revision >= (_rev))
++
+ #define DWC3_VER_IS(_ip, _ver)						\
+ 	(DWC3_IP_IS(_ip) && dwc->revision == _ip##_REVISION_##_ver)
+ 
+diff --git a/drivers/usb/dwc3/gadget.c b/drivers/usb/dwc3/gadget.c
+index 1cd4eed2..184f39e9 100644
+--- a/drivers/usb/dwc3/gadget.c
++++ b/drivers/usb/dwc3/gadget.c
+@@ -100,7 +100,7 @@ int dwc3_gadget_set_link_state(struct dwc3 *dwc, enum dwc3_link_state state)
+ 	 * Wait until device controller is ready. Only applies to 1.94a and
+ 	 * later RTL.
+ 	 */
+-	if (dwc->revision >= DWC3_REVISION_194A) {
++	if (DWC3_REV_GE(DWC3_REVISION_194A)) {
+ 		while (--retries) {
+ 			reg = dwc3_readl(dwc->regs, DWC3_DSTS);
+ 			if (reg & DWC3_DSTS_DCNRD)
+@@ -124,7 +124,7 @@ int dwc3_gadget_set_link_state(struct dwc3 *dwc, enum dwc3_link_state state)
+ 	 * The following code is racy when called from dwc3_gadget_wakeup,
+ 	 * and is not needed, at least on newer versions
+ 	 */
+-	if (dwc->revision >= DWC3_REVISION_194A)
++	if (DWC3_REV_GE(DWC3_REVISION_194A))
+ 		return 0;
+ 
+ 	/* wait for a change in DSTS */
+@@ -1404,7 +1404,7 @@ static int dwc3_gadget_wakeup(struct usb_gadget *g)
+ 	}
+ 
+ 	/* Recent versions do this automatically */
+-	if (dwc->revision < DWC3_REVISION_194A) {
++	if (DWC3_REV_LT(DWC3_REVISION_194A)) {
+ 		/* write zeroes to Link Change Request */
+ 		reg = dwc3_readl(dwc->regs, DWC3_DCTL);
+ 		reg &= ~DWC3_DCTL_ULSTCHNGREQ_MASK;
+@@ -1453,12 +1453,12 @@ static int dwc3_gadget_run_stop(struct dwc3 *dwc, int is_on, int suspend)
+ 
+ 	reg = dwc3_readl(dwc->regs, DWC3_DCTL);
+ 	if (is_on) {
+-		if (dwc->revision <= DWC3_REVISION_187A) {
++		if (DWC3_REV_LE(DWC3_REVISION_187A)) {
+ 			reg &= ~DWC3_DCTL_TRGTULST_MASK;
+ 			reg |= DWC3_DCTL_TRGTULST_RX_DET;
+ 		}
+ 
+-		if (dwc->revision >= DWC3_REVISION_194A)
++		if (DWC3_REV_GE(DWC3_REVISION_194A))
+ 			reg &= ~DWC3_DCTL_KEEP_CONNECT;
+ 		reg |= DWC3_DCTL_RUN_STOP;
+ 
+@@ -1576,7 +1576,7 @@ static int dwc3_gadget_start(struct usb_gadget *g,
+ 	 * STAR#9000525659: Clock Domain Crossing on DCTL in
+ 	 * USB 2.0 Mode
+ 	 */
+-	if (dwc->revision < DWC3_REVISION_220A) {
++	if (DWC3_REV_LT(DWC3_REVISION_220A)) {
+ 		reg |= DWC3_DCFG_SUPERSPEED;
+ 	} else {
+ 		switch (dwc->maximum_speed) {
+@@ -1963,7 +1963,7 @@ static void dwc3_endpoint_transfer_complete(struct dwc3 *dwc,
+ 	 * WORKAROUND: This is the 2nd half of U1/U2 -> U0 workaround.
+ 	 * See dwc3_gadget_linksts_change_interrupt() for 1st half.
+ 	 */
+-	if (dwc->revision < DWC3_REVISION_183A) {
++	if (DWC3_REV_LT(DWC3_REVISION_183A)) {
+ 		u32		reg;
+ 		int		i;
+ 
+@@ -2236,7 +2236,7 @@ static void dwc3_gadget_reset_interrupt(struct dwc3 *dwc)
+ 	 * STAR#9000466709: RTL: Device : Disconnect event not
+ 	 * generated if setup packet pending in FIFO
+ 	 */
+-	if (dwc->revision < DWC3_REVISION_188A) {
++	if (DWC3_REV_LT(DWC3_REVISION_188A)) {
+ 		if (dwc->setup_packet_pending)
+ 			dwc3_gadget_disconnect_interrupt(dwc);
+ 	}
+@@ -2311,7 +2311,7 @@ static void dwc3_gadget_conndone_interrupt(struct dwc3 *dwc)
+ 		 * STAR#9000483510: RTL: SS : USB3 reset event may
+ 		 * not be generated always when the link enters poll
+ 		 */
+-		if (dwc->revision < DWC3_REVISION_190A)
++		if (DWC3_REV_LT(DWC3_REVISION_190A))
+ 			dwc3_gadget_reset_interrupt(dwc);
+ 
+ 		dwc3_gadget_ep0_desc.wMaxPacketSize = cpu_to_le16(512);
+@@ -2338,7 +2338,7 @@ static void dwc3_gadget_conndone_interrupt(struct dwc3 *dwc)
+ 
+ 	/* Enable USB2 LPM Capability */
+ 
+-	if ((dwc->revision > DWC3_REVISION_194A)
++	if ((DWC3_REV_GT(DWC3_REVISION_194A))
+ 			&& (speed != DWC3_DCFG_SUPERSPEED)) {
+ 		reg = dwc3_readl(dwc->regs, DWC3_DCFG);
+ 		reg |= DWC3_DCFG_LPM_CAP;
+@@ -2355,10 +2355,10 @@ static void dwc3_gadget_conndone_interrupt(struct dwc3 *dwc)
+ 		 * BESL value in the LPM token is less than or equal to LPM
+ 		 * NYET threshold.
+ 		 */
+-		if (dwc->revision < DWC3_REVISION_240A	&& dwc->has_lpm_erratum)
++		if (DWC3_REV_LT(DWC3_REVISION_240A)	&& dwc->has_lpm_erratum)
+ 			WARN(true, "LPM Erratum not available on dwc3 revisisions < 2.40a\n");
+ 
+-		if (dwc->has_lpm_erratum && dwc->revision >= DWC3_REVISION_240A)
++		if (dwc->has_lpm_erratum && DWC3_REV_GE(DWC3_REVISION_240A))
+ 			reg |= DWC3_DCTL_LPM_ERRATA(dwc->lpm_nyet_threshold);
+ 
+ 		dwc3_gadget_dctl_write_safe(dwc, reg);
+@@ -2427,7 +2427,7 @@ static void dwc3_gadget_linksts_change_interrupt(struct dwc3 *dwc,
+ 	 * operational mode
+ 	 */
+ 	pwropt = DWC3_GHWPARAMS1_EN_PWROPT(dwc->hwparams.hwparams1);
+-	if ((dwc->revision < DWC3_REVISION_250A) &&
++	if ((DWC3_REV_LT(DWC3_REVISION_250A)) &&
+ 			(pwropt != DWC3_GHWPARAMS1_EN_PWROPT_HIB)) {
+ 		if ((dwc->link_state == DWC3_LINK_STATE_U3) &&
+ 				(next == DWC3_LINK_STATE_RESUME)) {
+@@ -2454,7 +2454,7 @@ static void dwc3_gadget_linksts_change_interrupt(struct dwc3 *dwc,
+ 	 * STAR#9000446952: RTL: Device SS : if U1/U2 ->U0 takes >128us
+ 	 * core send LGO_Ux entering U0
+ 	 */
+-	if (dwc->revision < DWC3_REVISION_183A) {
++	if (DWC3_REV_LT(DWC3_REVISION_183A)) {
+ 		if (next == DWC3_LINK_STATE_U0) {
+ 			u32	u1u2;
+ 			u32	reg;
+diff --git a/include/initcall.h b/include/initcall.h
+index 220a55ad..13f83f89 100644
+--- a/include/initcall.h
++++ b/include/initcall.h
+@@ -12,9 +12,20 @@
+ 
+ _Static_assert(EVT_COUNT < 256, "Can only support 256 event types with 8 bits");
+ 
++/*
++ * Called before each initcall (ret 0) and again when one fails (its return value): for a board whose console is not
++ * up yet to show how far the start got and what failed (board/samsung/exynos-mobile paints it into the framebuffer).
++ */
++void board_initcall_mark(const char *seq, const char *name, int ret);
++
+ #define INITCALL(_call) \
+ 	do { \
+-		if (_call()) { \
++		int __initcall_ret; \
++		board_initcall_mark(__func__, #_call, 0); \
++		__initcall_ret = _call(); \
++		if (__initcall_ret) { \
++			board_initcall_mark(__func__, #_call, \
++					    __initcall_ret); \
+ 			printf("%s(): initcall %s() failed\n", __func__, \
+ 			       #_call); \
+ 			hang(); \
+diff --git a/lib/efi_loader/efi_qcom_usb.c b/lib/efi_loader/efi_qcom_usb.c
+index 185b6472..e6183630 100644
+--- a/lib/efi_loader/efi_qcom_usb.c
++++ b/lib/efi_loader/efi_qcom_usb.c
+@@ -390,6 +390,81 @@ static int qusb_string(u8 index, void *buf)
+ 	return s[0];
+ }
+ 
++/*
++ * Microsoft OS 1.0 descriptors, as U-Boot's own fastboot gadget gives them (f_fastboot.c): Windows asks for string 0xEE
++ * the first time it sees a device, then, with the vendor code in it, for the compatible ID (wIndex 4: "WINUSB", so the
++ * in-box WinUSB driver takes the interface with no .inf) and the extended properties (wIndex 5: the interface GUID,
++ * U-Boot fastboot's, which fastboot.exe found on the S20). Without them the loader is an unknown device on Windows.
++ */
++#define QUSB_MS_VENDOR_CODE	0xbc
++
++static int qusb_ms_os_string(u8 *buf)
++{
++	static const char sig[] = "MSFT100";
++
++	buf[0] = 18;
++	buf[1] = USB_DT_STRING;
++	for (int i = 0; i < 7; i++) {
++		buf[2 + 2 * i] = sig[i];
++		buf[3 + 2 * i] = 0;
++	}
++	buf[16] = QUSB_MS_VENDOR_CODE;
++	buf[17] = 0;
++	return 18;
++}
++
++static int qusb_utf16(u8 *dst, const char *s)
++{
++	int n = 0;
++
++	for (; *s; s++, n += 2) {
++		dst[n] = *s;
++		dst[n + 1] = 0;
++	}
++	dst[n] = 0;
++	dst[n + 1] = 0;
++	return n + 2;
++}
++
++static int qusb_ms_os_vendor(const struct usb_ctrlrequest *ctrl, u8 *buf)
++{
++	static const char name[] = "DeviceInterfaceGUID";
++	static const char guid[] = "{4866319A-F4D6-4374-93B9-DC2DEB361BA9}";
++	u16 w_index = le16_to_cpu(ctrl->wIndex);
++	int n, len;
++
++	if (ctrl->bRequest != QUSB_MS_VENDOR_CODE)
++		return -EOPNOTSUPP;
++	if (w_index == 4) {				/* extended compatible ID */
++		memset(buf, 0, 40);
++		put_unaligned_le32(40, buf);
++		put_unaligned_le16(0x0100, buf + 4);
++		put_unaligned_le16(4, buf + 6);
++		buf[8] = 1;				/* one function */
++		buf[16] = 0;				/* interface 0 */
++		buf[17] = 1;
++		memcpy(buf + 18, "WINUSB", 6);
++		return 40;
++	}
++	if (w_index == 5) {				/* extended properties: the interface GUID */
++		put_unaligned_le16(0x0100, buf + 4);
++		put_unaligned_le16(5, buf + 6);
++		put_unaligned_le16(1, buf + 8);		/* one property */
++		n = 10;
++		put_unaligned_le32(1, buf + n + 4);	/* REG_SZ */
++		len = qusb_utf16(buf + n + 10, name);
++		put_unaligned_le16(len, buf + n + 8);
++		n += 10 + len;
++		len = qusb_utf16(buf + n + 4, guid);
++		put_unaligned_le32(len, buf + n);
++		n += 4 + len;
++		put_unaligned_le32(n - 10, buf + 10);	/* the property's own size */
++		put_unaligned_le32(n, buf);
++		return n;
++	}
++	return -EOPNOTSUPP;
++}
++
+ static int qusb_setup(struct usb_gadget *gadget, const struct usb_ctrlrequest *ctrl)
+ {
+ 	u16 w_length = le16_to_cpu(ctrl->wLength);
+@@ -400,6 +475,10 @@ static int qusb_setup(struct usb_gadget *gadget, const struct usb_ctrlrequest *c
+ 
+ 	qdbg("setup %02x %02x %04x %04x %04x\n", ctrl->bRequestType, ctrl->bRequest, w_value,
+ 	     le16_to_cpu(ctrl->wIndex), w_length);
++	if ((ctrl->bRequestType & USB_TYPE_MASK) == USB_TYPE_VENDOR && (ctrl->bRequestType & USB_DIR_IN)) {
++		value = qusb_ms_os_vendor(ctrl, buf);
++		goto reply;
++	}
+ 	if ((ctrl->bRequestType & USB_TYPE_MASK) != USB_TYPE_STANDARD)
+ 		return -EOPNOTSUPP;
+ 
+@@ -431,7 +510,10 @@ static int qusb_setup(struct usb_gadget *gadget, const struct usb_ctrlrequest *c
+ 			value = qusb.config_len;
+ 			break;
+ 		case USB_DT_STRING:
+-			value = qusb_string(w_value & 0xff, buf);
++			if ((w_value & 0xff) == 0xee)
++				value = qusb_ms_os_string(buf);
++			else
++				value = qusb_string(w_value & 0xff, buf);
+ 			break;
+ 		}
+ 		break;
+@@ -450,6 +532,7 @@ static int qusb_setup(struct usb_gadget *gadget, const struct usb_ctrlrequest *c
+ 		value = 1;
+ 		break;
+ 	}
++reply:
+ 	if (value < 0)
+ 		return value;
+ 	req->length = min_t(u16, w_length, value);

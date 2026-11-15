@@ -1,0 +1,20 @@
+# never: firmware, images, device dumps, Apple or Samsung files
+*.img
+*.simg
+*.ipsw
+*.apfs
+*.dmg
+*.bin
+*.efi
+*.hklg
+*.dtb
+*.lz4
+*.tar
+*.zip
+*.7z
+backup*/
+logs/
+sysimage/
+fw-*/
+identity.h
+*.log
