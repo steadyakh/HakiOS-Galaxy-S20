@@ -1,0 +1,552 @@
+diff --git a/.github/workflows/x1s-kernel.yml b/.github/workflows/x1s-kernel.yml
+new file mode 100644
+index 0000000..f4bc88d
+--- /dev/null
++++ b/.github/workflows/x1s-kernel.yml
+@@ -0,0 +1,137 @@
++# The Galaxy S20 5G (x1s): the open HakiOS kernel (GICv2 for the Exynos990), the loader without Apple's data, the
++# raw-syscall `hello` RAM disk, and an HKUB container of the loader and that payload for U-Boot's fastboot:
++#
++#   fastboot stage x1s-hello.hkub          (U-Boot's menu: "HakiOS over USB (fastboot)")
++#   fastboot continue                      (U-Boot: hakios load fastboot, hakios boot)
++#
++# The kernel is built on Linux as xnu-deps/setup.sh describes (and as the A71's was): theos's Linux iOS toolchain and
++# the iPhoneOS 16.5 SDK of github.com/theos/sdks, fetched for the build and not kept. Nothing of iOS's user space.
++name: x1s kernel
++on:
++  workflow_dispatch:
++    inputs:
++      cmdline:
++        description: The kernel's arguments
++        default: "-v cpus=1 exynos_thermal=1 hello_wait=12 loader_return_after=30"
++  push:
++    branches: ["s20"]
++    paths:
++      - 'xnu/**'
++      - 'xnuloader/**'
++      - 'drivers/**'
++      - 'userland/src/**'
++      - 'userland/libmini/**'
++      - 'userland/build.sh'
++      - '.github/workflows/x1s-kernel.yml'
++env:
++  THEOS: /home/runner/theos
++  X1S_CMDLINE: ${{ inputs.cmdline || '-v cpus=1 exynos_thermal=1 hello_wait=12 loader_return_after=30' }}
++jobs:
++  build:
++    runs-on: ubuntu-24.04
++    timeout-minutes: 240
++    steps:
++      - uses: actions/checkout@v4
++
++      # Ubuntu's mirrors hang now and then: time-limited and retried
++      - name: Packages
++        timeout-minutes: 20
++        run: |
++          apt_opts="-o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -o Acquire::Retries=3"
++          for try in 1 2 3; do sudo timeout 300 apt-get $apt_opts update && break; done
++          for try in 1 2 3; do
++            sudo timeout 600 apt-get $apt_opts install -y git curl tar xz-utils make build-essential clang lld llvm \
++              flex bison m4 perl python3 python3-venv autoconf automake libtool uuid-dev libssl-dev cpio && break
++          done
++
++      - name: theos's Linux iOS toolchain and the iPhoneOS 16.5 SDK
++        run: |
++          mkdir -p "$THEOS/toolchain" "$THEOS/sdks"
++          curl -fsSL --retry 3 https://github.com/L1ghtmann/llvm-project/releases/latest/download/iOSToolchain-x86_64.tar.xz \
++            | tar -xJ -C "$THEOS/toolchain"
++          test -x "$THEOS/toolchain/linux/iphone/bin/ld"
++          git clone -q --depth 1 --filter=blob:none --sparse https://github.com/theos/sdks.git "$THEOS/sdks-git"
++          git -C "$THEOS/sdks-git" sparse-checkout set iPhoneOS16.5.sdk
++          ln -s ../sdks-git/iPhoneOS16.5.sdk "$THEOS/sdks/iPhoneOS16.5.sdk"
++          test -d "$THEOS/sdks/iPhoneOS16.5.sdk/usr/include"
++
++      # Not `make kernel`: on a fresh checkout it would skip xnu-deps/setup.sh (its wrapper is in the repository)
++      - name: The kernel
++        run: |
++          set -o pipefail
++          mkdir -p logs
++          { xnu/apply.sh && xnu-deps/setup.sh && ./xnu-build.sh -j$(nproc) -k; } > logs/kernel-build.log 2>&1 || true
++          grep -nE 'setup:|error:|Error [0-9]|No such file|not found|command not found' logs/kernel-build.log | head -n 60 || true
++          K=xnu-src/xnu-8796.121.2/BUILD/obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837
++          test -f "$K" || { echo "no kernel was built"; tail -n 60 logs/kernel-build.log; exit 1; }
++          ls -la "$K"
++          echo "KERNEL=$K" >> "$GITHUB_ENV"
++
++      - name: The loader (no Apple data) and hello
++        run: |
++          make loader-open
++          make hello
++          ls -la xnuloader/loader.efi userland/hello
++
++      # Our user-space programs for the iOS system image (init, stage0, the libraries injected into SpringBoard and
++      # backboardd...): compiled against the SDK alone. No Apple file is here: the empty sysimage/rootfs/usr/lib only
++      # tells build.sh to compile the dynamically linked ones too. The images are made on the owner's PC
++      # (PREBUILT=1 PREBUILT_DIR=<this artifact> userland/build.sh), where the owner's own IPSW is unpacked.
++      - name: Our user-space programs
++        continue-on-error: true
++        run: |
++          set -o pipefail
++          mkdir -p sysimage/rootfs/usr/lib out-userland
++          COMPILE_ONLY=1 userland/build.sh 2>&1 | tee logs/userland-build.log | tail -n 30
++          grep -q "not compiling" logs/userland-build.log && { echo "no cross toolchain found"; exit 1; }
++          cp userland/hello out-userland/
++          for f in userland/obj/*; do
++            case "$f" in *.o|*.new|*.tsv) continue ;; esac
++            [ -f "$f" ] && cp "$f" out-userland/
++          done
++          (cd out-userland && sha256sum * | tee SHA256SUMS)
++
++      - uses: actions/upload-artifact@v4
++        with:
++          name: x1s-userland
++          path: out-userland/
++          retention-days: 30
++          if-no-files-found: ignore
++
++      - name: The payload and the container for U-Boot
++        run: |
++          mkdir -p out
++          python3 xnuloader/mkpayload.py -o out/x1s-hello-payload.bin kernel="$KERNEL" ramdisk=userland/hello \
++            --cmdline "$X1S_CMDLINE"
++          python3 - <<'EOF'
++          import sys
++          sys.path.insert(0, 'tools')
++          from mkubootimg import container
++          payload = open('out/x1s-hello-payload.bin', 'rb').read()
++          loader = open('xnuloader/loader.efi', 'rb').read()
++          open('out/x1s-hello.hkub', 'wb').write(container([('payload', payload), ('loader', loader)]))
++          EOF
++          # the heat guard's power-off, tried on purpose: a limit of 20 C, which a phone at rest is above
++          python3 xnuloader/mkpayload.py -o out/x1s-stoptest-payload.bin kernel="$KERNEL" ramdisk=userland/hello             --cmdline "-v cpus=1 exynos_thermal=1 exynos_thermal_stop=20 hello_wait=15 loader_return_after=30"
++          python3 - <<'EOF'
++          import sys
++          sys.path.insert(0, 'tools')
++          from mkubootimg import container
++          payload = open('out/x1s-stoptest-payload.bin', 'rb').read()
++          loader = open('xnuloader/loader.efi', 'rb').read()
++          open('out/x1s-stoptest.hkub', 'wb').write(container([('payload', payload), ('loader', loader)]))
++          EOF
++          cp "$KERNEL" out/kernel-x1s
++          cp xnuloader/loader.efi out/loader-open.efi
++          cp logs/kernel-build.log out/
++          echo "$X1S_CMDLINE" > out/cmdline.txt
++          (cd out && sha256sum * | tee SHA256SUMS)
++
++      - uses: actions/upload-artifact@v4
++        if: always()
++        with:
++          name: x1s-kernel
++          path: |
++            out/
++            logs/
++          retention-days: 30
+diff --git a/.github/workflows/x1s-mesa.yml b/.github/workflows/x1s-mesa.yml
+new file mode 100644
+index 0000000..d89e354
+--- /dev/null
++++ b/.github/workflows/x1s-mesa.yml
+@@ -0,0 +1,97 @@
++# The Galaxy S20 5G (x1s): Mesa with Panfrost for the phone's Mali-G77 (devices/x1s/PLAN.md "GPU", step G4), cross-built
++# for Darwin the way tools/mk-mesa.sh builds it for redwood's Adreno: Mesa 25.0.7 with tools/mesa/*.patch (the G77 and the
++# Darwin pieces of Panfrost: tools/mesa/zz-panfrost-darwin.patch), the libdrm stand-in tools/mesa/hakios-drm, the
++# kernel's compiler wrapper (xnu-deps/setup.sh --stage1) against theos's iPhoneOS 16.5 SDK. The result, libOSMesa.8.dylib,
++# goes into the system image on the owner's computer (devices/x1s/build-images.sh), never into the repository.
++name: x1s mesa
++on:
++  workflow_dispatch:
++  push:
++    branches: ["s20"]
++    paths:
++      - 'tools/mesa/**'
++      - 'tools/mk-mesa.sh'
++      - '.github/workflows/x1s-mesa.yml'
++env:
++  THEOS: /home/runner/theos
++jobs:
++  build:
++    runs-on: ubuntu-24.04
++    timeout-minutes: 120
++    steps:
++      - uses: actions/checkout@v4
++
++      - name: Packages
++        timeout-minutes: 20
++        run: |
++          apt_opts="-o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -o Acquire::Retries=3"
++          for try in 1 2 3; do sudo timeout 300 apt-get $apt_opts update && break; done
++          for try in 1 2 3; do
++            sudo timeout 600 apt-get $apt_opts install -y git curl tar xz-utils make build-essential clang lld llvm \
++              flex bison m4 perl python3 python3-venv autoconf automake libtool uuid-dev libssl-dev cpio \
++              meson ninja-build && break
++          done
++
++      - name: theos's Linux iOS toolchain and the iPhoneOS 16.5 SDK
++        run: |
++          mkdir -p "$THEOS/toolchain" "$THEOS/sdks"
++          curl -fsSL --retry 3 https://github.com/L1ghtmann/llvm-project/releases/latest/download/iOSToolchain-x86_64.tar.xz \
++            | tar -xJ -C "$THEOS/toolchain"
++          test -x "$THEOS/toolchain/linux/iphone/bin/ld"
++          git clone -q --depth 1 --filter=blob:none --sparse https://github.com/theos/sdks.git "$THEOS/sdks-git"
++          git -C "$THEOS/sdks-git" sparse-checkout set iPhoneOS16.5.sdk
++          ln -s ../sdks-git/iPhoneOS16.5.sdk "$THEOS/sdks/iPhoneOS16.5.sdk"
++
++      - name: The kernel's compiler wrapper (xnu-deps stage 1)
++        run: |
++          set -o pipefail
++          mkdir -p logs
++          xnu-deps/setup.sh --stage1 > logs/xnu-deps.log 2>&1 || { tail -n 60 logs/xnu-deps.log; exit 1; }
++          ls -la xnu-deps/host/bin/xnu-clang
++
++      - name: Mesa (softpipe, panfrost)
++        run: |
++          set -o pipefail
++          DRIVERS=softpipe,panfrost tools/mk-mesa.sh 2>&1 | tail -n 20 || {
++            B=xnu-deps/build/mesa
++            echo "--- meson"; tail -n 40 $B/meson-setup.log 2>/dev/null
++            echo "--- errors"; grep -n -B2 -A6 'error:' $B/ninja.log 2>/dev/null | head -n 200
++            echo "--- end of ninja.log"; tail -n 40 $B/ninja.log 2>/dev/null
++            exit 1
++          }
++          mkdir -p out-mesa
++          cp xnu-deps/build/mesa/out/* out-mesa/
++          (cd out-mesa && sha256sum * | tee SHA256SUMS)
++
++      # Our user-space programs with this Mesa (GL=1: libhakios.gl, the OpenGL ES table CoreAnimation draws through,
++      # gl_test, libOSMesa): compiled against the SDK alone, as x1s-kernel.yml does without GL. The whole set is what
++      # devices/x1s/build-images.sh takes (PREBUILT_DIR) on the owner's computer.
++      - name: Our user-space programs, with GL
++        run: |
++          set -o pipefail
++          mkdir -p sysimage/rootfs/usr/lib out-userland-gl
++          GL=1 COMPILE_ONLY=1 userland/build.sh 2>&1 | tee logs/userland-gl-build.log | tail -n 30
++          for f in userland/obj/*; do
++            case "$f" in *.o|*.new|*.tsv|*.h) continue ;; esac
++            [ -f "$f" ] && cp "$f" out-userland-gl/
++          done
++          (cd out-userland-gl && sha256sum * | tee SHA256SUMS)
++
++      - uses: actions/upload-artifact@v4
++        with:
++          name: x1s-userland-gl
++          path: out-userland-gl/
++          retention-days: 30
++          if-no-files-found: ignore
++
++      - uses: actions/upload-artifact@v4
++        if: always()
++        with:
++          name: x1s-mesa
++          path: |
++            out-mesa/
++            xnu-deps/build/mesa/meson-setup.log
++            xnu-deps/build/mesa/ninja.log
++            xnu-deps/build/mesa/build-softpipe-panfrost/src/gallium/targets/osmesa/libOSMesa.8.dylib
++          retention-days: 30
++          if-no-files-found: ignore
+diff --git a/.github/workflows/x1s-wintools.yml b/.github/workflows/x1s-wintools.yml
+new file mode 100644
+index 0000000..14c8e25
+--- /dev/null
++++ b/.github/workflows/x1s-wintools.yml
+@@ -0,0 +1,44 @@
++# Windows helpers for unpacking the owner's IPSW on the owner's own computer (Apple's files never come here):
++# the LZBITMAP decompressor (xnu-deps/build/lzbitmap/libzbitmap.c, Corellium, GPL-2.0+ OR MIT) and Apple's LZFSE
++# (github.com/lzfse/lzfse, BSD-3-Clause), as 64-bit Windows DLLs that sysimage/apfs-extract.py calls with ctypes.
++# Only open-source code is built here; nothing of iOS is read or written.
++name: x1s wintools
++on:
++  workflow_dispatch:
++  push:
++    branches: ["s20"]
++    paths:
++      - 'xnu-deps/build/lzbitmap/**'
++      - '.github/workflows/x1s-wintools.yml'
++jobs:
++  build:
++    runs-on: ubuntu-24.04
++    timeout-minutes: 30
++    steps:
++      - uses: actions/checkout@v4
++
++      - name: MinGW-w64
++        timeout-minutes: 15
++        run: |
++          apt_opts="-o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -o Acquire::Retries=3"
++          for try in 1 2 3; do sudo timeout 300 apt-get $apt_opts update && break; done
++          for try in 1 2 3; do sudo timeout 600 apt-get $apt_opts install -y gcc-mingw-w64-x86-64 && break; done
++          x86_64-w64-mingw32-gcc --version | head -1
++
++      - name: The DLLs
++        run: |
++          mkdir -p out
++          x86_64-w64-mingw32-gcc -O2 -shared -static-libgcc -o out/zbitmap.dll xnu-deps/build/lzbitmap/libzbitmap.c \
++            -Wl,--export-all-symbols
++          git clone -q --depth 1 https://github.com/lzfse/lzfse.git "$RUNNER_TEMP/lzfse"
++          x86_64-w64-mingw32-gcc -O2 -shared -static-libgcc -o out/lzfse.dll "$RUNNER_TEMP"/lzfse/src/lzfse_*.c \
++            "$RUNNER_TEMP"/lzfse/src/lzvn_*.c -I"$RUNNER_TEMP"/lzfse/src -Wl,--export-all-symbols
++          cp "$RUNNER_TEMP/lzfse/LICENSE" out/LICENSE.lzfse
++          git -C "$RUNNER_TEMP/lzfse" rev-parse HEAD > out/lzfse.revision
++          (cd out && sha256sum * | tee SHA256SUMS)
++
++      - uses: actions/upload-artifact@v4
++        with:
++          name: x1s-wintools
++          path: out/
++          retention-days: 90
+diff --git a/.github/workflows/x1s.yml b/.github/workflows/x1s.yml
+new file mode 100644
+index 0000000..88b02a2
+--- /dev/null
++++ b/.github/workflows/x1s.yml
+@@ -0,0 +1,80 @@
++# The Galaxy S20 5G (x1s): HakiOS's U-Boot (devices/x1s/u-boot) and the HakiOS loader built without Apple's data
++# (make loader-open: enough for U-Boot's first test and the open kernel, not for Darwin).
++#
++# The boot image itself is packed on the owner's computer (devices/x1s/mkbootimg.py): it carries the phone's own device
++# tree from the backup of its boot partition, which is Samsung's and never comes here.
++name: x1s
++on:
++  workflow_dispatch:
++  push:
++    branches: ["s20"]
++    paths:
++      - 'devices/x1s/**'
++      - 'xnuloader/**'
++      - '.github/workflows/x1s.yml'
++jobs:
++  build:
++    runs-on: ubuntu-24.04
++    timeout-minutes: 45
++    steps:
++      - uses: actions/checkout@v4
++
++      # Ubuntu's mirrors hang now and then (11 Nov 2026: twice for 10 minutes): time-limited, and the build goes on
++      # with what the runner image has; the AArch64 compiler then comes from Arm's own release.
++      - name: Packages
++        timeout-minutes: 8
++        continue-on-error: true
++        run: |
++          apt_opts="-o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 -o Acquire::Retries=2"
++          sudo timeout 180 apt-get $apt_opts update || echo "apt-get update did not finish"
++          sudo timeout 240 apt-get $apt_opts install -y gcc-aarch64-linux-gnu bison flex bc libssl-dev libgnutls28-dev \
++            uuid-dev device-tree-compiler python3-dev python3-setuptools swig clang lld || echo "apt-get install did not finish"
++
++      - name: AArch64 compiler
++        run: |
++          if command -v aarch64-linux-gnu-gcc >/dev/null; then
++            echo "CROSS_COMPILE=aarch64-linux-gnu-" >> "$GITHUB_ENV"
++          else
++            v=14.2.rel1
++            curl -fsSL --retry 3 -o "$RUNNER_TEMP/tc.tar.xz" \
++              "https://developer.arm.com/-/media/Files/downloads/gnu/$v/binrel/arm-gnu-toolchain-$v-x86_64-aarch64-none-linux-gnu.tar.xz"
++            mkdir -p "$RUNNER_TEMP/tc" && tar -xJf "$RUNNER_TEMP/tc.tar.xz" -C "$RUNNER_TEMP/tc" --strip-components=1
++            echo "$RUNNER_TEMP/tc/bin" >> "$GITHUB_PATH"
++            echo "CROSS_COMPILE=aarch64-none-linux-gnu-" >> "$GITHUB_ENV"
++          fi
++
++      - name: hakios-uefi (HakiOS's U-Boot changes), at the manifest's revision
++        run: |
++          rev=$(awk '/^uefi hakios-uefi/{f=1} f&&/revision/{print $2; exit}' devices/manifest.conf)
++          git clone -q https://github.com/oosexgang/hakios-uefi.git uefi
++          git -C uefi checkout -q "$rev"
++          echo "hakios-uefi at $rev, U-Boot $(cat uefi/u-boot/BASE)"
++
++      - name: U-Boot for x1s
++        run: bash devices/x1s/u-boot/build.sh
++
++      - name: The loader (no Apple data)
++        continue-on-error: true
++        run: |
++          # lld-link: apt's lld, else the LLVM the runner image carries
++          command -v lld-link >/dev/null || for v in 20 19 18 17 16; do
++            [ -x /usr/lib/llvm-$v/bin/lld-link ] && { export PATH=/usr/lib/llvm-$v/bin:$PATH; break; }
++          done
++          command -v lld-link || { ls /usr/lib/llvm-*/bin/ | grep -i lld; exit 1; }
++          PLACEHOLDER=1 bash xnuloader/mkidentity.sh
++          bash xnuloader/build.sh
++
++      - name: Collect
++        run: |
++          mkdir -p out
++          cp u-boot-x1s/build/u-boot.bin out/u-boot-x1s.bin
++          cp u-boot-x1s/build/.config out/u-boot-x1s.config
++          cp u-boot-x1s/build/u-boot.dtb out/u-boot-x1s.dtb
++          cp xnuloader/loader.efi out/loader-open.efi || echo "no loader this time"
++          (cd out && sha256sum * | tee SHA256SUMS)
++
++      - uses: actions/upload-artifact@v4
++        with:
++          name: x1s
++          path: out/
++          retention-days: 30
+diff --git a/docs/boot-args.md b/docs/boot-args.md
+index 0b2df4c..3ec998a 100644
+--- a/docs/boot-args.md
++++ b/docs/boot-args.md
+@@ -2,7 +2,7 @@
+ 
+ Made by `tools/boot-args.py --markdown`; CI fails if it is out of date with the source (`tools/boot-args.py --check`).
+ 
+-Every argument that the kernel, the loader or user space of this port reads, and which file reads it. **350 arguments**: 279 read by the kernel, 14 by the loader, 68 by user space (one is read in more than one place).
++Every argument that the kernel, the loader or user space of this port reads, and which file reads it. **366 arguments**: 295 read by the kernel, 14 by the loader, 68 by user space (one is read in more than one place).
+ 
+ This is a catalogue of what exists and who reads it, not a manual. What an argument means is in the head of the file that reads it. The stable switches have a symbol in the configuration (`tools/hakios-config.py help SYMBOL`, `docs/configs.md`); the rest are the knobs of bring-up (a driver's steps, pauses, traces, test modes) and can change with the driver. Any of them can be given in a configuration with `CONFIG_BOOTARGS="name=value ..."`, which checks that each name is in this list. What the arguments of the two Metal paths do: [Metal on the Adreno](reference/metal.md#boot-arguments).
+ 
+@@ -343,7 +343,7 @@ Layers: **K** the kernel, **L** the loader, **U** user space (through `sysctl ke
+ | `thermal_tm0` | K | `hakios.thermal.c` | `CONFIG_THERMAL_TM0` |  |
+ | `thermal_tm1` | K | `hakios.thermal.c` | `CONFIG_THERMAL_TM1` |  |
+ 
+-## CPU, memory and boot (23)
++## CPU, memory and boot (24)
+ 
+ | Argument | Layer | Read by | Configuration | Set by |
+ |---|---|---|---|---|
+@@ -359,6 +359,7 @@ Layers: **K** the kernel, **L** the loader, **U** user space (through `sysctl ke
+ | `hv_wdt_pet` | K | `loader_return.c` |  | the loader, when it has armed the watchdog (the runner also passes it) |
+ | `loader_return_after` | KL | `loader.c`, `loader_return.c` |  | xl (XL_SECS) |
+ | `machine_name` | K | `GenericARMPE.cpp` | `CONFIG_MACHINE_NAME` |  |
++| `mali_bisect` | K | `loader_return.c` | `CONFIG_MALI_BISECT` |  |
+ | `membench` | K | `hakios.cpufreq.c` | `CONFIG_MEMBENCH` |  |
+ | `rd` | KL | `(patch)`, `loader.c` | `CONFIG_RD` |  |
+ | `regtrace` | K | `(patch)` | `CONFIG_REGTRACE` |  |
+@@ -393,7 +394,7 @@ Layers: **K** the kernel, **L** the loader, **U** user space (through `sysctl ke
+ | `ufs` | L | `loader.c` | `CONFIG_UFS` |  |
+ | `ufs_probe` | L | `loader.c` | `CONFIG_UFS_PROBE` |  |
+ 
+-## User space (35)
++## User space (50)
+ 
+ | Argument | Layer | Read by | Configuration | Set by |
+ |---|---|---|---|---|
+@@ -405,12 +406,24 @@ Layers: **K** the kernel, **L** the loader, **U** user space (through `sysctl ke
+ | `ca_vbl` | U | `inject.c` | `CONFIG_CA_VBL` |  |
+ | `caenv` | U | `inject.c`, `inject_sb.c` | `CONFIG_CAENV` |  |
+ | `cc_fade` | U | `inject_sb.c` | `CONFIG_CC_FADE` |  |
++| `exynos_thermal` | K | `hakios.exynos_thermal.c` | `CONFIG_EXYNOS_THERMAL` |  |
++| `exynos_thermal_gpu_stop` | K | `hakios.exynos_thermal.c` | `CONFIG_EXYNOS_THERMAL_GPU_STOP` |  |
++| `exynos_thermal_poll` | K | `hakios.exynos_thermal.c` | `CONFIG_EXYNOS_THERMAL_POLL` |  |
++| `exynos_thermal_stop` | K | `hakios.exynos_thermal.c` | `CONFIG_EXYNOS_THERMAL_STOP` |  |
+ | `gl` | U | `inject.c`, `inject_sb.c` | `CONFIG_GL` |  |
+ | `glcompile` | U | `inject.c` | `CONFIG_GLCOMPILE` |  |
+ | `glno` | U | `inject.c` | `CONFIG_GLNO` |  |
+ | `glsb3` | U | `inject.c` | `CONFIG_GLSB3` |  |
+ | `glyes` | U | `inject.c` | `CONFIG_GLYES` |  |
+ | `m2v_utrace` | U | `HakiosMetalCA.m` | `CONFIG_M2V_UTRACE` |  |
++| `mali` | K | `hakios.mali.c` | `CONFIG_MALI` |  |
++| `mali_clk` | K | `hakios.mali.c` | `CONFIG_MALI_CLK` |  |
++| `mali_cycle` | K | `hakios.mali.c` | `CONFIG_MALI_CYCLE` |  |
++| `mali_early` | K | `hakios.mali.c` | `CONFIG_MALI_EARLY` |  |
++| `mali_hot` | K | `hakios.mali.c` | `CONFIG_MALI_HOT` |  |
++| `mali_keep` | K | `hakios.mali.c` | `CONFIG_MALI_KEEP` |  |
++| `mali_return` | K | `hakios.mali.c` | `CONFIG_MALI_RETURN` |  |
++| `mali_tz` | K | `hakios.mali.c` | `CONFIG_MALI_TZ` |  |
+ | `metal_all` | U | `HakiosMetalCA.m` | `CONFIG_METAL_ALL` |  |
+ | `metal_defer` | U | `HakiosMetalCA.m` | `CONFIG_METAL_DEFER` |  |
+ | `metal_dump` | U | `HakiosMetalCA.m` | `CONFIG_METAL_DUMP` |  |
+@@ -425,6 +438,9 @@ Layers: **K** the kernel, **L** the loader, **U** user space (through `sysctl ke
+ | `metal_watch` | U | `inject.c` | `CONFIG_METAL_WATCH` |  |
+ | `root_apfs` | U | `init.c` | `CONFIG_ROOT_APFS` |  |
+ | `sb_delay` | U | `inject_sb.c` |  | xl (XL_SB_DELAY) |
++| `sec_ts` | K | `hakios.sec_ts.c` | `CONFIG_SEC_TS` |  |
++| `sec_ts_flip` | K | `hakios.sec_ts.c` | `CONFIG_SEC_TS_FLIP` |  |
++| `sec_ts_poll_us` | K | `hakios.sec_ts.c` | `CONFIG_SEC_TS_POLL_US` |  |
+ | `switcher_wallpaper` | U | `inject_sb.c` | `CONFIG_SWITCHER_WALLPAPER` |  |
+ | `tu_debug` | U | `HakiosMetalCA.m` | `CONFIG_TU_DEBUG` |  |
+ | `ui_lite` | U | `inject_sb.c` | `CONFIG_UI_LITE` |  |
+diff --git a/tools/win-bin/python3 b/tools/win-bin/python3
+new file mode 100755
+index 0000000..027456f
+--- /dev/null
++++ b/tools/win-bin/python3
+@@ -0,0 +1,5 @@
++#!/bin/sh
++# python3 for Git Bash on Windows, where "python3" is the Microsoft Store's stub and the real interpreter is "python"
++# (python.org's installer). The scripts here start with "#!/usr/bin/env python3"; with tools/win-bin first on PATH
++# they run under the real one. Not for Linux or macOS.
++exec python "$@"
+diff --git a/xl b/xl
+index f544465..1bdea4f 100755
+--- a/xl
++++ b/xl
+@@ -34,8 +34,12 @@
+ #               there from Android): a long session of runs never waits for Android to start
+ #   XL_REBOOT_AFTER=1  when the run is over, send the phone back to Android (it charges there; in the loader it does not,
+ #               and its screen stays on: a phone left in the loader overnight is a flat one by morning)
+-#   XL_FIRMWARE=u-boot|silicium   what the phone's bootloader starts the loader with (default: Silicium's UEFI when its
+-#               image is built, else HakiOS's U-Boot: docs/u-boot.md); either way from RAM, nothing is flashed
++#   XL_FIRMWARE=u-boot|silicium|x1s   what the phone's bootloader starts the loader with (default: Silicium's UEFI when its
++#               image is built, else HakiOS's U-Boot: docs/u-boot.md); either way from RAM, nothing is flashed.
++#               x1s (found by itself when fastboot says product samsung-x1s): the Galaxy S20's U-Boot, which IS its boot
++#               image (devices/x1s); its menu's "HakiOS over USB" waits in fastboot, and the loader is sent there with
++#               `fastboot stage` and started with `fastboot continue`. There is no Android to go back to: XL_HOME=fastboot
++#   XL_KERNEL   the kernel to run (default hakios-kernel, then prebuilt/hakios-kernel); for the S20, CI's kernel-x1s
+ #   XL_SB_DELAY seconds SpringBoard waits before it starts (default 8; see userland/src/inject_sb.c)
+ #               Among XL_CMDLINE, for the phone: bootcpu=7 runs the kernel on the biggest core instead of
+ #               the small one the firmware starts on (the loader then watches from the first core, and a
+@@ -56,8 +60,10 @@ cd "$(dirname "$(readlink -f "$0")")" || exit 1
+ # On a Mac: flock, GNU timeout and stat, and Android's platform-tools, from tools/macos-bin (see its README)
+ [ "$(uname)" = Darwin ] && PATH=$PWD/tools/macos-bin:$PWD/tools/macos-bin/platform-tools:$PATH
+ # the kernel and the loader built here, or else the ones that come with the repository
+-K=hakios-kernel                 # make kernel makes it
+-[ -f $K ] || K=prebuilt/hakios-kernel
++K=${XL_KERNEL:-hakios-kernel}   # make kernel makes it
++[ -f "$K" ] || K=prebuilt/hakios-kernel
++# On Windows (Git Bash): flock and a python3 that is python, from tools/win-bin (docs/windows.md)
++case "$(uname)" in MINGW*|MSYS*) PATH=$PWD/tools/win-bin:$PATH ;; esac
+ L=xnuloader/loader.efi
+ if [ ! -f $L ]; then
+ 	L=prebuilt/loader.efi
+@@ -126,8 +132,11 @@ recover_phone() {
+ # (it is made from the phone's own vendor drivers and is not in the repository), else U-Boot's.
+ firmware() {
+ 	case "${XL_FIRMWARE:-}" in
+-	u-boot|silicium) echo "$XL_FIRMWARE"; return ;;
++	u-boot|silicium|x1s) echo "$XL_FIRMWARE"; return ;;
+ 	esac
++	if in_fastboot && fb getvar product | grep -q 'product: samsung-x1s'; then
++		echo x1s; return
++	fi
+ 	if [ -f Mu-Silicium/Build/redwoodPkg/RELEASE_CLANGPDB/FV/SILICIUM_UEFI.fd ] || [ -f devices/redwood/prebuilt/SILICIUM_UEFI.fd ]; then
+ 		echo silicium
+ 	else
+@@ -146,6 +155,18 @@ enter() {
+ 		enter; return ;;
+ 	esac
+ 	xnuloader/mkpayload.py -o usb-payload.bin loader.efi=$L --usb >/dev/null || { echo "xl: payload build failed"; return 1; }
++	if [ "$(firmware)" = x1s ]; then
++		# the S20's U-Boot: an HKUB container (the loader, and the payload that keeps it on USB) into its fastboot,
++		# then `continue`, after which its menu item runs `hakios load fastboot && hakios boot`
++		python3 -c 'import sys; sys.path.insert(0, "tools"); from mkubootimg import container
++open(sys.argv[3], "wb").write(container([("payload", open(sys.argv[2], "rb").read()), ("loader", open(sys.argv[1], "rb").read())]))' \
++			"$L" usb-payload.bin xnu-usb.hkub || { echo "xl: container build failed"; return 1; }
++		FB_TIMEOUT=40 fb stage xnu-usb.hkub | grep -q OKAY || { echo "xl: upload to U-Boot failed"; return 1; }
++		fb continue >/dev/null
++		sleep 4
++		wait_for loader 30 && { rm -f $PHONE.ran; return 0; }
++		echo "xl: loader did not come up on USB (state: $(state))"; return 1
++	fi
+ 	case "$(firmware)" in
+ 	u-boot) tools/mkubootimg.py -d "${DEVICE:-redwood}" -l $L -p usb-payload.bin -o xnu-usb.img >/dev/null ;;
+ 	*) ./mkxnuimg.py -p usb-payload.bin -o xnu-usb.img >/dev/null ;;
+@@ -223,10 +244,20 @@ run() { # run <oem command> <label>
+ 		# resets without a word leaves all it said up to then ($log.live)
+ 		local XL_FOLLOW=${XL_FOLLOW-10}      # (a run that hangs leaves $log.live: what the kernel said up to a few seconds before)
+ 		local deadline=$(( $(date +%s) + ${XL_SECS:-8} + 100 )) followed=$(date +%s)
++		local followed0=$followed during_done=
+ 		while :; do
+ 			result=$(FB_TIMEOUT=15 fb getvar result | grep '^result:')
+ 			case "$result" in ""|*running*) ;; *) break ;; esac
+ 			[ "$(date +%s)" -ge "$deadline" ] && { result=; break; }
++			# XL_DURING="oem poke 18502400 5a5a5000;oem peek 18502400": loader commands sent once, XL_DURING_AT seconds
++			# into the run (default 30), each followed by "getvar:peek": registers seen from the loader's own core while
++			# the kernel runs (cpus=2 or more)
++			if [ -n "$XL_DURING" ] && [ -z "$during_done" ] && [ $(( $(date +%s) - followed0 )) -ge "${XL_DURING_AT:-30}" ]; then
++				during_done=1
++				local IFS_OLD="$IFS" one; IFS=';'
++				for one in $XL_DURING; do IFS="$IFS_OLD"; fb $one >/dev/null; echo "xl: during the run: $one -> $(fb getvar peek | grep '^peek:')"; IFS=';'; done
++				IFS="$IFS_OLD"
++			fi
+ 			if [ -n "$XL_FOLLOW" ] && [ $(( $(date +%s) - followed )) -ge "$XL_FOLLOW" ]; then
+ 				followed=$(date +%s)
+ 				# (XL_FOLLOW_KEEP=1: every one kept, $log.live.1, .2, ...: a long run's middle, which the log

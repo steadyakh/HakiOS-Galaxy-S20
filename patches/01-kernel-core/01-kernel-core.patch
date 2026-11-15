@@ -1,0 +1,756 @@
+diff --git a/.gitignore b/.gitignore
+index 799d52b..b53d273 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -2,9 +2,12 @@
+ # clones and files of Darwin, none of which belongs in the repository. Nothing is tracked unless it
+ # is named here.
+ /*
++!/AGENTS.md
++!/CLAUDE.md
+ !/hakios-metal/
+ !/.gitignore
+ !/.gitattributes
++!/.github/
+ !/VERSION
+ !/README.md
+ !/CONTRIBUTING.md
+@@ -121,6 +124,7 @@ __pycache__/
+ !/devices/manifest.conf
+ !/devices/README.md
+ !/devices/qemu/
++!/devices/x1s/
+ 
+ # Android platform-tools for xl on a Mac (tools/macos-bin/README.md): not part of the repository
+ /tools/macos-bin/platform-tools
+diff --git a/configs/boot-args.lst b/configs/boot-args.lst
+index cb2079e..b162947 100644
+--- a/configs/boot-args.lst
++++ b/configs/boot-args.lst
+@@ -89,6 +89,10 @@ ddr_rest	k
+ ddr_vote	k
+ display_probe	k
+ epoch	k
++exynos_thermal	k
++exynos_thermal_gpu_stop	k
++exynos_thermal_poll	k
++exynos_thermal_stop	k
+ fb_beam	k
+ fb_beat	k
+ fb_ca_hz	k
+@@ -154,6 +158,15 @@ hv_wdt_pet	k
+ loader_return_after	kl
+ m2v_utrace	u
+ machine_name	k
++mali	k
++mali_bisect	k
++mali_clk	k
++mali_cycle	k
++mali_early	k
++mali_hot	k
++mali_keep	k
++mali_return	k
++mali_tz	k
+ membench	k
+ metal	ku
+ metal_all	u
+@@ -238,6 +251,9 @@ return_cpu	k
+ return_panic	k
+ root_apfs	u
+ sb_delay	u
++sec_ts	k
++sec_ts_flip	k
++sec_ts_poll_us	k
+ serial	l
+ small_cores	k
+ small_cores_after	k
+diff --git a/configs/symbols.tsv b/configs/symbols.tsv
+index 17df562..ccf00eb 100644
+--- a/configs/symbols.tsv
++++ b/configs/symbols.tsv
+@@ -80,6 +80,10 @@ DDR	arg	ddr	CPU, memory and boot	k	hakios.cpufreq.c	the memory's bus clock manag
+ DDR_REST	arg	ddr_rest	CPU, memory and boot	k	hakios.cpufreq.c	
+ DDR_VOTE	arg	ddr_vote	CPU, memory and boot	k	hakios.cpufreq.c	
+ DISPLAY_PROBE	arg	display_probe	GPU and display	k	hakios.adreno.c	before any step: read what the firmware left the display controller doing (display_probe() below; two clocks are turned on, nothing else written)
++EXYNOS_THERMAL	arg	exynos_thermal	User space	k	hakios.exynos_thermal.c	
++EXYNOS_THERMAL_GPU_STOP	arg	exynos_thermal_gpu_stop	User space	k	hakios.exynos_thermal.c	
++EXYNOS_THERMAL_POLL	arg	exynos_thermal_poll	User space	k	hakios.exynos_thermal.c	how often (200 to 10000; 1000)
++EXYNOS_THERMAL_STOP	arg	exynos_thermal_stop	User space	k	hakios.exynos_thermal.c	power off at this temperature (20 to 70; 70): lower to test the power-off
+ FB_BEAM	arg	fb_beam	GPU and display	k	MiniIOMobileFramebuffer.cpp	frames written to the panel's memory whenever their beat comes, as before
+ FB_BEAT	arg	fb_beat	GPU and display	k	MiniIOMobileFramebuffer.cpp	
+ FB_CA_HZ	arg	fb_ca_hz	GPU and display	k	MiniIOMobileFramebuffer.cpp	the refresh rate told to CoreAnimation (IOMFBDisplayRefresh) when it is not to be fb_hz's
+@@ -140,6 +144,15 @@ GPU_LOG	arg	gpu_log	GPU and display	k	hakios.adreno.c
+ HAPTIC_EFFECT	arg	haptic_effect	Haptics and torch	k	hakios.haptic.c	
+ M2V_UTRACE	arg	m2v_utrace	User space	u	HakiosMetalCA.m	Turnip's GPU trace of every render pass (u_trace) into a file, printed during the run
+ MACHINE_NAME	arg	machine_name	CPU, memory and boot	k	GenericARMPE.cpp	
++MALI	arg	mali	User space	k	hakios.mali.c	the first N steps (1: read only; 5: everything)
++MALI_BISECT	arg	mali_bisect	CPU, memory and boot	k	loader_return.c	
++MALI_CLK	arg	mali_clk	User space	k	hakios.mali.c	when step 2 finds that our writes do not reach the GPU: its clock started as Samsung's power-on
++MALI_CYCLE	arg	mali_cycle	User space	k	hakios.mali.c	when step 2 finds that our writes do not reach the GPU: the G3D domain switched off and on
++MALI_EARLY	arg	mali_early	User space	k	hakios.mali.c	
++MALI_HOT	arg	mali_hot	User space	k	hakios.mali.c	no power on, and the cores off at once, at or above this G3D temperature (30 to 60; 50)
++MALI_KEEP	arg	mali_keep	User space	k	hakios.mali.c	with the GPU powered (step 3 done), kept on for the system (HakiosGPU, Panfrost's interface)
++MALI_RETURN	arg	mali_return	User space	k	hakios.mali.c	after the steps, back to the loader instead of starting the system
++MALI_TZ	arg	mali_tz	User space	k	hakios.mali.c	
+ MEMBENCH	arg	membench	CPU, memory and boot	k	hakios.cpufreq.c	
+ METAL	arg	metal	GPU and display	ku	HakiosMetal.m,MiniIOMobileFramebuffer.cpp,inject_sb.c	only the program metal_test (userland/src/metal_test.m): the safe level, for seeing what Metal does with the device
+ METAL_ALL	arg	metal_all	User space	u	HakiosMetalCA.m	
+@@ -216,6 +229,9 @@ REGTRACE	arg	regtrace	CPU, memory and boot	k	(patch)
+ RETURN_CPU	arg	return_cpu	CPU, memory and boot	k	loader_return.c	
+ RETURN_PANIC	arg	return_panic	CPU, memory and boot	k	loader_return.c	
+ ROOT_APFS	arg	root_apfs	User space	u	init.c	the root is to be the Darwin root volume on /dev/DEV -- the phone's flash, read only
++SEC_TS	arg	sec_ts	User space	k	hakios.sec_ts.c	every address below belongs to this phone
++SEC_TS_FLIP	arg	sec_ts_flip	User space	k	hakios.sec_ts.c	
++SEC_TS_POLL_US	arg	sec_ts_poll_us	User space	k	hakios.sec_ts.c	how often the interrupt line is looked at (1000 to 50000; 8000)
+ SERIAL	arg	serial	Loader	l	loader.c	
+ SMALL_CORES	arg	small_cores	CPU, memory and boot	k	(patch)	
+ SMALL_CORES_AFTER	arg	small_cores_after	CPU, memory and boot	k	GenericARMPE.cpp	
+diff --git a/drivers/core/hakios.platform.c b/drivers/core/hakios.platform.c
+index 85fd700..4ab8adf 100644
+--- a/drivers/core/hakios.platform.c
++++ b/drivers/core/hakios.platform.c
+@@ -22,6 +22,20 @@
+ /* kern.hakios: the node every driver of this port hangs its sysctls under (it was hakios.battery.c's) */
+ SYSCTL_NODE(_kern, OID_AUTO, hakios, CTLFLAG_RW | CTLFLAG_LOCKED, 0, "redwood phone bits");
+ 
++/* kern.hakios.remote: the last command the host sent through a watching loader, "NUMBER STEPS" (0 before any) */
++extern uint64_t loader_remote(char *buf, size_t size);
++
++static int
++hakios_sysctl_remote(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2, struct sysctl_req *req)
++{
++	char steps[240], out[272];
++
++	snprintf(out, sizeof(out), "%llu %s", loader_remote(steps, sizeof(steps)), steps);
++	return SYSCTL_OUT(req, out, strlen(out) + 1);
++}
++SYSCTL_PROC(_kern_hakios, OID_AUTO, remote, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, NULL, 0,
++    hakios_sysctl_remote, "A", "touches from the computer: the last command, NUMBER STEPS (userland/src/rwremote.c)");
++
+ static LCK_GRP_DECLARE(hakios_platform_lock_group, "hakios-platform");
+ 
+ /*
+diff --git a/drivers/core/hakios.stubs.c b/drivers/core/hakios.stubs.c
+index ed5ca7f..8f5d7a9 100644
+--- a/drivers/core/hakios.stubs.c
++++ b/drivers/core/hakios.stubs.c
+@@ -41,6 +41,10 @@ void hakios_virtio_input_init(void) {}
+ void hakios_goodix_init(void) {}
+ #endif
+ 
++#ifndef HAKIOS_SEC_TS
++void hakios_sec_ts_init(void) {}
++#endif
++
+ #ifndef HAKIOS_BUTTONS
+ void hakios_buttons_init(void) {}
+ #endif
+@@ -76,6 +80,18 @@ void hakios_adreno_stop(void) {}
+ void hakios_adreno_minute(void) {}
+ #endif
+ 
++#ifndef HAKIOS_MALI
++void hakios_mali_init(void) {}
++void hakios_mali_stop(void) {}
++#endif
++
++#ifndef HAKIOS_EXYNOS_THERMAL
++int hakios_exynos_temperature(__unused uint32_t zone) { return -1; }   /* no guard: no temperature, so no GPU power on */
++int hakios_exynos_acpm(__unused uint32_t channel, __unused uint32_t cmd[4]) { return ENODEV; }
++void hakios_exynos_acpm_show(__unused uint32_t channel) {}
++void hakios_exynos_acpm_list(void) {}
++#endif
++
+ #ifndef HAKIOS_WIFI
+ void hakios_wifi_init(void) {}
+ void hakios_wifi_stop(void) {}
+diff --git a/drivers/core/hakios.stubs.cpp b/drivers/core/hakios.stubs.cpp
+index be721ec..0e19cfb 100644
+--- a/drivers/core/hakios.stubs.cpp
++++ b/drivers/core/hakios.stubs.cpp
+@@ -11,4 +11,30 @@ MiniIOSurfaceDrawn(__unused MiniIOSurface * surface, __unused uint64_t milliseco
+ {
+ 	return true;
+ }
++/* the Mali's driver keeps its GPU for the service of hakios.gpu.cpp, which is the Adreno driver's file */
++extern "C" void HakiosGPUStartMali(void);
++void
++HakiosGPUStartMali(void)
++{
++}
++#endif
++
++#ifndef HAKIOS_MALI
++/* hakios.gpu.cpp's backend for the Mali (hakios.mali.c), left out: never chosen, as nothing starts it */
++extern "C" {
++bool hakios_mali_gpu_ready(void) { return false; }
++bool hakios_mali_gpu_parameter(uint32_t, uint64_t *) { return false; }
++uint64_t hakios_mali_gpu_address(uint64_t) { return 0; }
++void hakios_mali_gpu_address_free(uint64_t, uint64_t) {}
++bool hakios_mali_gpu_map(uint64_t, uint64_t, bool) { return false; }
++void hakios_mali_gpu_mapped(void) {}
++void hakios_mali_gpu_unmap(uint64_t, uint64_t) {}
++void hakios_mali_gpu_to_memory(void *, uint64_t) {}
++uint32_t hakios_mali_gpu_submit(const uint64_t *, const uint32_t *, uint32_t) { return 0; }
++bool hakios_mali_gpu_done(uint32_t) { return true; }
++uint32_t hakios_mali_gpu_last(void) { return 0; }
++void hakios_mali_gpu_worked(uint64_t *, uint32_t *, uint32_t *) {}
++void hakios_mali_gpu_report(const char *) {}
++void hakios_mali_gpu_stop(void) {}
++}
+ #endif
+diff --git a/drivers/map b/drivers/map
+index a291d3b..32ca6e1 100644
+--- a/drivers/map
++++ b/drivers/map
+@@ -9,6 +9,7 @@
+ # Subsystems: input storage gpu camera haptic audio power wifi bluetooth modem net core
+ 
+ input    bsd/dev/hakios.goodix.c
++input    bsd/dev/hakios.sec_ts.c
+ input    bsd/dev/hakios.focaltech_fw.h
+ input    bsd/dev/hakios.input.c
+ input    bsd/dev/hakios.buttons.c
+@@ -24,6 +25,7 @@ storage  bsd/dev/hakios.virtio_blk.c
+ 
+ gpu      bsd/dev/hakios.adreno.c
+ gpu      iokit/Kernel/hakios.gpu.cpp
++gpu      bsd/dev/hakios.mali.c
+ 
+ camera   bsd/dev/hakios.camera.c
+ camera   bsd/dev/hakios.torch.c
+@@ -64,6 +66,7 @@ core     bsd/dev/hakios.stubs.c
+ core     iokit/Kernel/hakios.stubs.cpp
+ core    bsd/dev/hakios.socinfo.c
+ power   bsd/dev/hakios.thermal.c
++power   bsd/dev/hakios.exynos_thermal.c
+ power   bsd/dev/hakios.pmic.c
+ power   bsd/dev/hakios.battguard.c
+ bluetooth bsd/dev/hakios.bt.c
+diff --git a/xnu/files/osfmk/arm64/gic_v3_irq.c b/xnu/files/osfmk/arm64/gic_v3_irq.c
+index 63ffd4b..c5ce6d5 100644
+--- a/xnu/files/osfmk/arm64/gic_v3_irq.c
++++ b/xnu/files/osfmk/arm64/gic_v3_irq.c
+@@ -23,6 +23,16 @@
+  *
+  * Registers come from the device tree node /arm-io/gic:
+  *   reg = <distributor offset, size, redistributor offset, size>
++ *
++ * GICv2 (GIC-400, the Samsung Exynos990's) is handled here too, chosen by the
++ * node's compatible ("arm,gic-400", "arm,gic-v2", "arm,cortex-a15-gic"), with
++ *   reg = <distributor offset, size, CPU interface offset, size>
++ * The CPU interface is memory-mapped then (GICC_*) and the ICC_* system
++ * registers are never touched: below a hypervisor that does not offer them
++ * (Samsung's H-Arx) they would trap. SGIs and PPIs are banked in the
++ * distributor itself; an SGI is addressed by CPU interface number, which every
++ * processor learns from GICD_ITARGETSR0 as it sets itself up; a non-secure
++ * kernel cannot choose groups, its interrupts are Group 1 as they are.
+  */
+ #include <mach/mach_types.h>
+ #include <kern/debug.h>
+@@ -38,6 +48,7 @@
+ #include <pexpert/pexpert.h>
+ #include <pexpert/device_tree.h>
+ #include <pexpert/arm64/board_config.h>
++#include <string.h>
+ 
+ #if defined(GENERIC_GIC_V3_IRQ)
+ 
+@@ -82,6 +93,25 @@ static vm_offset_t gicd_base, gicr_base;
+ static vm_size_t   gicr_size;
+ static vm_offset_t gicr_cpu_base[MAX_CPUS]; /* each processor's redistributor frame */
+ 
++/* GICv2 (see above): the memory-mapped CPU interface instead of the redistributors and ICC_* */
++#define GICD_ITARGETSR(n)       (0x0800 + (n))  /* byte per interrupt */
++#define GICD_SGIR               0x0f00
++#define GICC_CTLR               0x0000
++#define GICC_CTLR_ENABLE        (1u << 0)       /* the non-secure view: Group 1 */
++#define GICC_CTLR_BYPASS_MASK   (0xfu << 5)     /* the bypass-disable bits, kept as the firmware left them */
++#define GICC_PMR                0x0004
++#define GICC_BPR                0x0008
++#define GICC_IAR                0x000c
++#define GICC_EOIR               0x0010
++#define GICC_INTID_MASK         0x3ff
++static bool        gic_v2;
++static vm_offset_t gicc_base;
++static bool        gic_v2_cpu_ready[MAX_CPUS];
++static struct {
++	uint32_t phys_id;
++	uint8_t  mask;                              /* its CPU interface, as GICD_ITARGETSR/GICD_SGIR take it */
++} gic_v2_targets[MAX_CPUS];
++
+ /*
+  * Acknowledged, not yet EOI'd; 0: none. The signal between processors is interrupt 0 and reads
+  * as 0 from ICC_IAR1_EL1, hence the mark: without it a core switched off in the middle of that
+@@ -132,10 +162,26 @@ gic_write32(vm_offset_t addr, uint32_t value)
+ 	*(volatile uint32_t *)addr = value;
+ }
+ 
++/* The end of an interrupt this processor acknowledged: its IAR value written back. */
++static void
++gic_end(uint64_t iar)
++{
++	if (gic_v2) {
++		__builtin_arm_dsb(DSB_SY);
++		gic_write32(gicc_base + GICC_EOIR, (uint32_t)iar);
++	} else {
++		__builtin_arm_wsr64("ICC_EOIR1_EL1", iar);
++		__builtin_arm_isb(ISB_SY);
++	}
++}
++
+ static void
+ gic_mask(uint32_t intid)
+ {
+-	if (intid < 32) {
++	if (gic_v2) {
++		/* SGIs and PPIs are banked in the distributor: this processor's own */
++		gic_write32(gicd_base + GICD_ICENABLER(intid / 32), 1u << (intid % 32));
++	} else if (intid < 32) {
+ 		gic_write32(gicr_cpu_base[cpu_number()] + GICR_ICENABLER0, 1u << intid);
+ 	} else {
+ 		gic_write32(gicd_base + GICD_ICENABLER(intid / 32), 1u << (intid % 32));
+@@ -153,6 +199,17 @@ gic_send_sgi(uint32_t phys_id, uint32_t sgi)
+ {
+ 	uint64_t aff0 = phys_id & 0xff, aff1 = (phys_id >> 8) & 0xff;
+ 
++	if (gic_v2) {
++		/* by CPU interface number: the one that processor found for itself when it set up */
++		for (unsigned i = 0; i < MAX_CPUS; i++) {
++			if (gic_v2_targets[i].mask != 0 && gic_v2_targets[i].phys_id == phys_id) {
++				__builtin_arm_dsb(DSB_ISHST);
++				gic_write32(gicd_base + GICD_SGIR, (uint32_t)gic_v2_targets[i].mask << 16 | (sgi & 0xf));
++				return;
++			}
++		}
++		return;         /* not set up yet: it cannot take an interrupt anyway */
++	}
+ 	__builtin_arm_wsr64("ICC_SGI1R_EL1", ((uint64_t)sgi << 24) | (aff1 << 16) | (1ULL << (aff0 & 15)));
+ 	__builtin_arm_isb(ISB_SY);
+ }
+@@ -254,13 +311,20 @@ gic_v3_spi_attach(uint32_t intid, bool edge, void (*handler)(void *context, uint
+ 	gic_v3_spi_mask(intid);
+ 	gic_write32(gicd_base + GICD_ICPENDR(intid / 32), 1u << (intid % 32));
+ 	gic_write32(gicd_base + GICD_ICACTIVER(intid / 32), 1u << (intid % 32));
+-	gic_write32(gicd_base + GICD_IGROUPR(intid / 32), gic_read32(gicd_base + GICD_IGROUPR(intid / 32)) | 1u << (intid % 32));
+-	gic_write32(gicd_base + GICD_IGRPMODR(intid / 32), gic_read32(gicd_base + GICD_IGRPMODR(intid / 32)) & ~(1u << (intid % 32)));
++	if (!gic_v2) {
++		gic_write32(gicd_base + GICD_IGROUPR(intid / 32), gic_read32(gicd_base + GICD_IGROUPR(intid / 32)) | 1u << (intid % 32));
++		gic_write32(gicd_base + GICD_IGRPMODR(intid / 32), gic_read32(gicd_base + GICD_IGRPMODR(intid / 32)) & ~(1u << (intid % 32)));
++	}
+ 	*(volatile uint8_t *)(gicd_base + GICD_IPRIORITYR(intid)) = GIC_PRIORITY_DEFAULT;
+ 	config = gic_read32(gicd_base + GICD_ICFGR(intid / 16)) & ~(3u << (intid % 16 * 2));
+ 	gic_write32(gicd_base + GICD_ICFGR(intid / 16), config | (edge ? 2u : 0u) << (intid % 16 * 2));
+-	/* GICD_IROUTER: Aff3 in [39:32], Aff2.Aff1.Aff0 in [23:0]; bit 31 (any processor) clear */
+-	*(volatile uint64_t *)(gicd_base + GICD_IROUTER(intid)) = (mpidr & 0xff00000000ull) | (mpidr & 0xffffff);
++	if (gic_v2) {
++		/* GICv2: to this processor's CPU interface (its bit, as GICD_ITARGETSR0 gave it) */
++		*(volatile uint8_t *)(gicd_base + GICD_ITARGETSR(intid)) = gic_v2_targets[cpu_number()].mask;
++	} else {
++		/* GICD_IROUTER: Aff3 in [39:32], Aff2.Aff1.Aff0 in [23:0]; bit 31 (any processor) clear */
++		*(volatile uint64_t *)(gicd_base + GICD_IROUTER(intid)) = (mpidr & 0xff00000000ull) | (mpidr & 0xffffff);
++	}
+ 	gic_distributor_settle();
+ 	gic_v3_spi_unmask(intid);
+ 	return KERN_SUCCESS;
+@@ -302,8 +366,8 @@ gic_irq_handler(__unused void *target, __unused void *refCon, __unused void *nub
+ 	int cpu = cpu_number();
+ 
+ 	for (;;) {
+-		uint64_t iar = __builtin_arm_rsr64("ICC_IAR1_EL1");
+-		uint32_t intid = (uint32_t)(iar & 0xffffff);
++		uint64_t iar = gic_v2 ? gic_read32(gicc_base + GICC_IAR) : __builtin_arm_rsr64("ICC_IAR1_EL1");
++		uint32_t intid = (uint32_t)(iar & (gic_v2 ? GICC_INTID_MASK : 0xffffff));
+ 
+ 		if (intid >= GIC_INTID_SPURIOUS_MIN) {
+ 			break;
+@@ -328,8 +392,7 @@ gic_irq_handler(__unused void *target, __unused void *refCon, __unused void *nub
+ 			gic_last_unhandled = intid;
+ 		}
+ 
+-		__builtin_arm_wsr64("ICC_EOIR1_EL1", iar);
+-		__builtin_arm_isb(ISB_SY);
++		gic_end(iar);
+ 		gic_active_iar[cpu] = 0;
+ 	}
+ }
+@@ -358,8 +421,7 @@ gic_v3_irq_quiesce(void)
+ 		}
+ 	}
+ 	if (gic_active_iar[cpu] != 0) {
+-		__builtin_arm_wsr64("ICC_EOIR1_EL1", gic_active_iar[cpu] & ~GIC_IAR_TAKEN);
+-		__builtin_arm_isb(ISB_SY);
++		gic_end(gic_active_iar[cpu] & ~GIC_IAR_TAKEN);
+ 		gic_active_iar[cpu] = 0;
+ 	}
+ }
+@@ -382,6 +444,15 @@ gic_v3_irq_cpu_shutdown(void)
+ 		return;
+ 	}
+ 	gic_v3_irq_quiesce();
++	if (gic_v2) {
++		/* this processor's banked SGIs and PPIs, then its CPU interface off (the bypass bits kept) */
++		gic_write32(gicd_base + GICD_ICENABLER(0), 0xffffffffu);
++		gic_write32(gicd_base + GICD_ICPENDR(0), 0xffffffffu);
++		gic_write32(gicd_base + GICD_ICACTIVER(0), 0xffffffffu);
++		gic_write32(gicc_base + GICC_CTLR, gic_read32(gicc_base + GICC_CTLR) & ~GICC_CTLR_ENABLE);
++		__builtin_arm_dsb(DSB_SY);
++		return;
++	}
+ 	gicr = gicr_cpu_base[cpu_number()];
+ 	if (gicr != 0) {
+ 		gic_write32(gicr + GICR_ICENABLER0, 0xffffffffu);
+@@ -412,6 +483,57 @@ gic_find_redistributor(void)
+ 	panic("gic: no redistributor for MPIDR 0x%llx", mpidr);
+ }
+ 
++/*
++ * GICv2 per-CPU bring-up. The SGIs and PPIs of this processor are banked in the distributor at
++ * the same addresses every processor uses; its CPU interface is the memory-mapped GICC.
++ */
++#define GICD_CPENDSGIR(n)       (0x0f10 + 4 * (n))     /* a byte per SGI: the sources it is pending from */
++
++static void
++gic_v2_cpu_init(int cpu, uint32_t mine)
++{
++	/* this processor's CPU interface: what GICD_ITARGETSR0 reads back here (0 on a uniprocessor GIC) */
++	uint8_t mask = *(volatile uint8_t *)(gicd_base + GICD_ITARGETSR(0));
++
++	if (mask == 0) {
++		mask = 1;
++	}
++
++	if (ml_get_cpu_count() > 1) {
++		uint32_t sgis = (1u << GIC_SGI_SIGNAL) | (1u << GIC_SGI_STOP);
++
++		/* as for GICv3: none of them left active or pending by an earlier kernel on this core */
++		gic_write32(gicd_base + GICD_ICACTIVER(0), sgis);
++		gic_write32(gicd_base + GICD_CPENDSGIR(0), 0x0000ffffu);   /* SGI 0 and 1, from every source */
++		*(volatile uint8_t *)(gicd_base + GICD_IPRIORITYR(GIC_SGI_SIGNAL)) = GIC_PRIORITY_DEFAULT;
++		*(volatile uint8_t *)(gicd_base + GICD_IPRIORITYR(GIC_SGI_STOP)) = GIC_PRIORITY_DEFAULT;
++		mine |= sgis;
++	}
++
++	/* the virtual timer's PPI (and the SGIs): default priority, enabled; a non-secure kernel's are Group 1 */
++	*(volatile uint8_t *)(gicd_base + GICD_IPRIORITYR(GIC_INTID_VTIMER)) = GIC_PRIORITY_DEFAULT;
++	gic_write32(gicd_base + GICD_ISENABLER(0), mine);
++
++	/* distributor on (normally already so) */
++	if (!(gic_read32(gicd_base + GICD_CTLR) & 1u)) {
++		gic_write32(gicd_base + GICD_CTLR, gic_read32(gicd_base + GICD_CTLR) | 1u);
++	}
++
++	/* CPU interface: every priority, no preemption grouping, on */
++	gic_write32(gicc_base + GICC_PMR, 0xff);
++	gic_write32(gicc_base + GICC_BPR, 0);
++	gic_write32(gicc_base + GICC_CTLR, (gic_read32(gicc_base + GICC_CTLR) & GICC_CTLR_BYPASS_MASK) | GICC_CTLR_ENABLE);
++	__builtin_arm_dsb(DSB_SY);
++
++	gic_v2_targets[cpu].phys_id = getCpuDatap()->cpu_phys_id;
++	gic_v2_targets[cpu].mask = mask;
++	gic_v2_cpu_ready[cpu] = true;
++
++	ml_install_interrupt_handler(NULL, 0, NULL, gic_irq_handler, NULL);
++	kprintf("gic: v2, distributor %p, CPU interface %p, cpu %d is interface mask 0x%x, virtual timer on PPI %d\n",
++	    (void *)gicd_base, (void *)gicc_base, cpu, mask, GIC_INTID_VTIMER);
++}
++
+ /* Per-CPU bring-up: every processor calls this for itself, the boot processor first. */
+ void
+ gic_v3_irq_cpu_init(void)
+@@ -432,15 +554,44 @@ gic_v3_irq_cpu_init(void)
+ 		}
+ 		uint64_t const *reg = prop;
+ 		vm_offset_t soc_base = pe_arm_get_soc_base_phys();
++		void const *compat;
++		unsigned int compat_size;
++
++		/* a GICv2 by its compatible ("arm,gic-400" and the like); anything else is a GICv3 as before */
++		if (SecureDTGetProperty(entry, "compatible", &compat, &compat_size) == kSuccess) {
++			char const *c = compat;
++			for (unsigned int at = 0; at < compat_size;) {
++				char const *s = c + at;
++				unsigned int len = (unsigned int)strnlen(s, compat_size - at);
++
++				if (!strncmp(s, "arm,gic-400", len) || !strncmp(s, "arm,gic-v2", len) ||
++				    !strncmp(s, "arm,cortex-a15-gic", len)) {
++					gic_v2 = true;
++				}
++				at += len + 1;
++			}
++		}
+ 
+ 		simple_lock_init(&gic_spi_lock, 0);
+ 		gicd_base = ml_io_map(soc_base + reg[0], reg[1]);
+-		gicr_base = ml_io_map(soc_base + reg[2], reg[3]);
+-		gicr_size = reg[3];
+-		if (gicd_base == 0 || gicr_base == 0) {
+-			panic("gic: cannot map the distributor/redistributor");
++		if (gic_v2) {
++			gicc_base = ml_io_map(soc_base + reg[2], reg[3]);
++			if (gicd_base == 0 || gicc_base == 0) {
++				panic("gic: cannot map the distributor/CPU interface");
++			}
++		} else {
++			gicr_base = ml_io_map(soc_base + reg[2], reg[3]);
++			gicr_size = reg[3];
++			if (gicd_base == 0 || gicr_base == 0) {
++				panic("gic: cannot map the distributor/redistributor");
++			}
+ 		}
+-	} else if (gicr_cpu_base[cpu] != 0) {
++	} else if (gic_v2 ? gic_v2_cpu_ready[cpu] : gicr_cpu_base[cpu] != 0) {
++		return;
++	}
++
++	if (gic_v2) {
++		gic_v2_cpu_init(cpu, mine);
+ 		return;
+ 	}
+ 
+diff --git a/xnu/files/osfmk/arm64/loader_return.c b/xnu/files/osfmk/arm64/loader_return.c
+index 6711f87..fb216c4 100644
+--- a/xnu/files/osfmk/arm64/loader_return.c
++++ b/xnu/files/osfmk/arm64/loader_return.c
+@@ -200,8 +200,12 @@ struct loader_live {
+ 	volatile uint64_t stop;         /* the loader's to write: the host has asked for the run to end */
+ 	uint64_t magic2;                /* "XNULIVE2": what follows is there (a loader may meet an older kernel) */
+ 	const uint64_t *sound;          /* loader_sound: the same for a recording of the sound */
++	uint64_t magic3;                /* "XNULIVE3": the remote mailbox follows */
++	volatile uint64_t remote_seq;   /* the loader's to write: goes up with every command from the host */
++	volatile char remote[240];      /* the command ("oem touch STEPS"): rwtouch's steps, ends with a zero */
+ };
+ 
++
+ /*
+  * A screen recording (the display driver makes one with boot-arg rec_secs): where it is, for the
+  * loader to hand to the host once the kernel is back. { physical address, bytes, kernel address }.
+@@ -215,8 +219,29 @@ struct loader_live loader_live = {
+ 	.log_wrapped = &loader_log_wrapped, .log_head = LOADER_LOG_HEAD, .log_ring = LOADER_LOG_RING,
+ 	.recording = loader_recording,
+ 	.magic2 = 0x324556494c554e58ULL, .sound = loader_sound,
++	.magic3 = 0x334556494c554e58ULL,
+ };
+ 
++/* kern.hakios.remote (drivers/core/hakios.platform.c): "NUMBER STEPS", for userland/src/rwremote.c */
++uint64_t
++loader_remote(char *buf, size_t size)
++{
++	uint64_t seq;
++	size_t i;
++
++	if (size == 0) {
++		return 0;
++	}
++	do {
++		seq = loader_live.remote_seq;
++		for (i = 0; i + 1 < size && i < sizeof(loader_live.remote) && loader_live.remote[i] != 0; i++) {
++			buf[i] = loader_live.remote[i];
++		}
++		buf[i] = 0;
++	} while (seq != loader_live.remote_seq);
++	return seq;
++}
++
+ /* Valid from the first instruction of C code: does not depend on gVirtBase/gPhysBase being set up. */
+ static inline uint64_t
+ static_kvtophys(const void *va)
+@@ -404,6 +429,32 @@ loader_return(void)
+ void
+ loader_checkpoint(uint64_t n)
+ {
++	/*
++	 * x1s GPU bisect (13 Nov): from checkpoint 17 on (the VM is up, ml_io_map works) every checkpoint ORs bit
++	 * (n - 17) into a mask that goes into the Mali's AS7_TRANSTAB_LO (0x185025c0), a register that does nothing by
++	 * itself. The loader reads it after the run: the mask as of the last write that reached the GPU. Writes from
++	 * start.s with the MMU off land; from EARLY_BOOT on they do not. Only with boot-arg mali_bisect=1.
++	 */
++	static vm_offset_t gpu_as_page;
++	static uint32_t mask;
++	static int bisect = -1;
++
++	if (n >= 17 && n <= 21) {               /* (30-44 come before arm_vm_init: no ml_io_map there) */
++		if (bisect < 0) {
++			uint32_t v = 0;
++
++			bisect = PE_parse_boot_argn("mali_bisect", &v, sizeof(v)) && v;
++		}
++		if (bisect) {
++			if (gpu_as_page == 0) {
++				gpu_as_page = ml_io_map(0x18502000, 0x1000);
++			}
++			if (gpu_as_page != 0) {
++				mask |= 1u << (n - 17);
++				__asm__ volatile ("dsb sy; str %w0, [%1]; dsb sy" : : "r" (mask), "r" (gpu_as_page + 0x5c0) : "memory");
++			}
++		}
++	}
+ 	if (loader_stub_slot[2] == n) {
+ 		loader_jump(2, n);
+ 	}
+diff --git a/xnu/files/osfmk/arm64/psci_smp.c b/xnu/files/osfmk/arm64/psci_smp.c
+index 221defa..7d73f59 100644
+--- a/xnu/files/osfmk/arm64/psci_smp.c
++++ b/xnu/files/osfmk/arm64/psci_smp.c
+@@ -64,6 +64,15 @@ extern unsigned long gVirtBase, gPhysBase;
+ 
+ /* The firmware is called with HVC, not SMC. (start.s reads this too, at its physical address.) */
+ uint32_t psci_smp_hvc;
++/* the firmware numbers a core by its MPIDR shifted down this far (/chosen/psci-target-shift; the S20: 8) */
++static uint32_t psci_smp_target_shift;
++/*
++ * A page below 4 GB the loader set aside (/chosen/psci-entry-page; the S20): its firmware keeps only the low 32 bits
++ * of CPU_ON's start address, and a core sent above 4 GB is lost until the next restart (test 28). The cores start
++ * there, at "ldr x9, .+8; br x9; .quad <the reset vector>".
++ */
++static uint64_t psci_smp_entry_page;
++static volatile uint32_t *psci_smp_entry_words;
+ 
+ /*
+  * Left by a core that took an exception between its first instruction and the kernel's vectors
+@@ -124,6 +133,15 @@ psci_smp_init(void)
+ 	    size >= 3 && strncmp((const char *)prop, "hvc", 3) == 0) {
+ 		psci_smp_hvc = 1;
+ 	}
++	if (SecureDTLookupEntry(NULL, "/chosen", &chosen) == kSuccess &&
++	    SecureDTGetProperty(chosen, "psci-target-shift", &prop, &size) == kSuccess && size == 4 &&
++	    *(const uint32_t *)prop < 32) {
++		psci_smp_target_shift = *(const uint32_t *)prop;
++	}
++	if (SecureDTLookupEntry(NULL, "/chosen", &chosen) == kSuccess &&
++	    SecureDTGetProperty(chosen, "psci-entry-page", &prop, &size) == kSuccess && size == 8) {
++		psci_smp_entry_page = *(const uint64_t *)prop;
++	}
+ }
+ 
+ /* A processor other than the boot processor says how far it has come. */
+@@ -185,8 +203,22 @@ psci_smp_start_cpu(int cpu)
+ 	}
+ 	__builtin_arm_dsb(DSB_SY);
+ 
++	if (psci_smp_entry_page != 0) {
++		if (psci_smp_entry_words == NULL) {
++			psci_smp_entry_words = (volatile uint32_t *)ml_io_map(psci_smp_entry_page, PAGE_SIZE);
++		}
++		if (psci_smp_entry_words != NULL) {
++			psci_smp_entry_words[0] = 0x58000049;          /* ldr x9, .+8 */
++			psci_smp_entry_words[1] = 0xd61f0120;          /* br x9 */
++			psci_smp_entry_words[2] = (uint32_t)entry;
++			psci_smp_entry_words[3] = (uint32_t)(entry >> 32);
++			__builtin_arm_dsb(DSB_SY);
++			entry = psci_smp_entry_page;
++		}
++	}
++
+ 	os_atomic_store(&psci_smp_cpu_stage[cpu], PSCI_SMP_CPU_ASKED, release);
+-	status = psci_call(PSCI_CPU_ON, phys_id, entry, 0);
++	status = psci_call(PSCI_CPU_ON, phys_id >> psci_smp_target_shift, entry, 0);
+ 	if (status != 0) {
+ 		os_atomic_store(&psci_smp_cpu_stage[cpu], 0, release);
+ 		printf("psci: cpu %d (MPIDR 0x%x) was not started: the firmware answers %lld (%s)\n",
+@@ -343,7 +375,7 @@ psci_smp_stop_others(void)
+ 		while (now < deadline) {
+ 			if (os_atomic_load(&psci_smp_cpu_stage[cpu], acquire) == PSCI_SMP_CPU_OFF) {
+ 				/* it has said it is going; the firmware knows when it has gone (if it can tell at all) */
+-				int64_t state = psci_call(PSCI_AFFINITY_INFO, cdp->cpu_phys_id, 0, 0);
++				int64_t state = psci_call(PSCI_AFFINITY_INFO, cdp->cpu_phys_id >> psci_smp_target_shift, 0, 0);
+ 
+ 				if (state == PSCI_AFFINITY_OFF || state < 0) {
+ 					break;
+@@ -352,7 +384,7 @@ psci_smp_stop_others(void)
+ 			now = mach_absolute_time();
+ 		}
+ 		if (os_atomic_load(&psci_smp_cpu_stage[cpu], acquire) != PSCI_SMP_CPU_OFF &&
+-		    psci_call(PSCI_AFFINITY_INFO, cdp->cpu_phys_id, 0, 0) != PSCI_AFFINITY_OFF) {
++		    psci_call(PSCI_AFFINITY_INFO, cdp->cpu_phys_id >> psci_smp_target_shift, 0, 0) != PSCI_AFFINITY_OFF) {
+ 			psci_smp_note(" did not stop: it is left running\n", cpu);
+ 		}
+ 	}
+diff --git a/xnu/hakios.patch b/xnu/hakios.patch
+index 3bade39..8c2eff1 100644
+--- a/xnu/hakios.patch
++++ b/xnu/hakios.patch
+@@ -2552,7 +2552,19 @@ index e76e7e70ab9c..828a51171c7e 100644
+  	ml_read_chip_revision(&topology_info.chip_revision);
+  
+  	/*
+-@@ -1427,17 +1542,15 @@ ml_processor_register(ml_processor_info_t *in_processor_info,
++@@ -1183,7 +1298,11 @@ ml_get_boot_cluster_type(void)
++ int
++ ml_get_cpu_number(uint32_t phys_id)
++ {
+++#if defined(GENERIC_PSCI_SMP)
+++	phys_id &= 0xFFFFFF;                    /* Affinity0-2, as the reset vector (the S20's Mongooses: 0x10000, 0x10100) */
+++#else
++ 	phys_id &= MPIDR_AFF1_MASK | MPIDR_AFF0_MASK;
+++#endif
++
++ 	for (unsigned i = 0; i < topology_info.num_cpus; i++) {
++ 		if (topology_info.cpus[i].phys_id == phys_id) {
++@@ -1427,17 +1546,15 @@ ml_processor_register(ml_processor_info_t *in_processor_info,
+  	processor_t processor = PERCPU_GET_RELATIVE(processor, cpu_data, this_cpu_datap);
+  	if (!is_boot_cpu) {
+  		processor_init(processor, this_cpu_datap->cpu_number, pset);
+@@ -2578,7 +2590,7 @@ index e76e7e70ab9c..828a51171c7e 100644
+  
+  	*processor_out = processor;
+  	*ipi_handler_out = cpu_signal_handler;
+-@@ -2237,8 +2350,16 @@ _enable_virtual_timer(void)
++@@ -2237,8 +2354,16 @@ _enable_virtual_timer(void)
+  	uint64_t cntvctl = CNTV_CTL_EL0_ENABLE; /* One wants to use 32 bits, but "mrs" prefers it this way */
+  
+  	__builtin_arm_wsr64("CNTV_CTL_EL0", cntvctl);
+@@ -2640,9 +2652,9 @@ index e5336e5a1cce..a54e35035cde 100644
+  	add		x19, x19, EXT(ResetHandlerData)@pageoff
+  	mrs		x15, MPIDR_EL1						// Load MPIDR to get CPU number
+ -#if HAS_CLUSTER
+-+#if HAS_CLUSTER || defined(GENERIC_PSCI_SMP)
+-+	// (generic boards: some number their cores in Affinity1 and leave Affinity0 at zero;
+-+	// a cpu data's phys id is both fields, as the device tree's "reg" has them)
+++#if defined(GENERIC_PSCI_SMP)
+++	and		x0, x15, #0xFFFFFF					// generic boards: Affinity0-2, as the device tree's "reg" has them (the S20's Mongooses: 0x10000, 0x10100)
+++#elif HAS_CLUSTER
+  	and		x0, x15, #0xFFFF					// CPU number in Affinity0, cluster ID in Affinity1
+  #else
+  	and		x0, x15, #0xFF						// CPU number is in MPIDR Affinity Level 0
+@@ -2838,7 +2850,7 @@ index e5336e5a1cce..a54e35035cde 100644
+  	.align 12, 0
+  
+  #if defined(KERNEL_INTEGRITY_KTRR) || defined(KERNEL_INTEGRITY_CTRR)
+-@@ -452,22 +611,51 @@ start_cpu:
++@@ -452,22 +611,57 @@ start_cpu:
+   * Cold boot init routine.  Called from __start
+   *   x0 - Boot args
+   */
+@@ -2878,6 +2890,12 @@ index e5336e5a1cce..a54e35035cde 100644
+  	mov		x20, x0
+  	mov		x21, #0
+ +	LOADER_CHECKPOINT 1
+++	// x1s GPU bisect (13 Nov): marker 1, AS2_TRANSTAB_LO = 0x11110000, the first instructions; the loader reads it after the run
+++	movz	x9, #0x1850, lsl #16
+++	movk	x9, #0x2480
+++	movz	w10, #0x1111, lsl #16
+++	str		w10, [x9]
+++	dsb		sy
+  
+ -	// Set low reset vector before attempting any loads
+ +	// Set low reset vector before attempting anything that might trap
+@@ -2893,11 +2911,17 @@ index e5336e5a1cce..a54e35035cde 100644
+  
+  	// Get the kernel memory parameters from the boot args
+  	ldr		x22, [x20, BA_VIRT_BASE]			// Get the kernel virt base
+-@@ -612,6 +800,7 @@ Lkernelcache_base_found:
++@@ -612,6 +800,13 @@ Lkernelcache_base_found:
+  	/* Ensure TTEs are visible */
+  	dsb		ish
+  
+ +	LOADER_CHECKPOINT 3
+++	// x1s GPU bisect (13 Nov): marker 3, AS3_TRANSTAB_LO = 0x33330000, before the MMU is on; the loader reads it after the run
+++	movz	x9, #0x1850, lsl #16
+++	movk	x9, #0x24c0
+++	movz	w10, #0x3333, lsl #16
+++	str		w10, [x9]
+++	dsb		sy
+  
+  	b		common_start
+  

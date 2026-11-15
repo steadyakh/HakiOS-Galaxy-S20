@@ -1,0 +1,650 @@
+diff --git a/sysimage/apfs-extract.py b/sysimage/apfs-extract.py
+new file mode 100644
+index 0000000..c6f25ca
+--- /dev/null
++++ b/sysimage/apfs-extract.py
+@@ -0,0 +1,269 @@
++#!/usr/bin/env python3
++"""Unpack the files of an APFS disk image on Windows, where 7-Zip cannot do it all.
++
++usage: apfs-extract.py --dlls DIR [options] IMAGE OUTDIR
++
++Windows' 7-Zip skips every file compressed with LZBITMAP (it reports "Unsupported Method" and
++leaves nothing, not even the two attribute files unzbm.c would finish), and a Windows folder
++cannot hold a symbolic link without developer mode. This reads the image with HakiOS's own APFS
++reader (../tools/apfs/apfs.py) instead and:
++
++  - writes every regular file, decompressed: zlib, LZVN, LZFSE and LZBITMAP, the last three with
++    zbitmap.dll and lzfse.dll (built from open source by .github/workflows/x1s-wintools.yml);
++  - writes no symbolic link, but lists each one, with its target, in OUTDIR.manifest, which has the
++    format of system.manifest ("mode<TAB>uid<TAB>gid<TAB>path[<TAB>target]", octal mode), so that
++    ../tools/apfs/mkapfs.py makes them, and owners and modes, when it builds the image;
++  - uses \\\\?\\ paths, so paths longer than 260 characters work.
++
++  --only PATH          only this subtree (e.g. System/Library/Caches/com.apple.dyld)
++  --skip-name NAME     leave out every file or directory with this name, wherever it is
++  --skip PATH          leave out this path and what is below it
++  --skip-glob PATTERN  leave out files whose name matches (e.g. '*.symbols*')
++  --volume NAME        the volume to read (default: the first with a root directory)
++
++Nothing is downloaded. The image is the user's, out of the user's own IPSW (ipsw-member.py).
++"""
++import argparse
++import ctypes
++import fnmatch
++import os
++import struct
++import sys
++import types
++
++sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tools", "apfs"))
++import apfs  # noqa: E402
++
++LZVN_MAGIC = 0x6e787662          # 'bvxn': an LZVN block inside an LZFSE stream
++END_MAGIC = 0x24787662           # 'bvx$': the end of the stream
++
++
++class Codecs:
++    def __init__(self, dlls):
++        self.zbm = ctypes.CDLL(os.path.join(dlls, "zbitmap.dll"))
++        self.zbm.zbm_decompress.restype = ctypes.c_int
++        self.zbm.zbm_decompress.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_char_p,
++                                            ctypes.c_size_t, ctypes.POINTER(ctypes.c_size_t)]
++        self.lz = ctypes.CDLL(os.path.join(dlls, "lzfse.dll"))
++        self.lz.lzfse_decode_buffer.restype = ctypes.c_size_t
++        self.lz.lzfse_decode_buffer.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_char_p,
++                                                ctypes.c_size_t, ctypes.c_void_p]
++        self.lz.lzfse_decode_scratch_size.restype = ctypes.c_size_t
++        self.scratch = ctypes.create_string_buffer(self.lz.lzfse_decode_scratch_size())
++
++    def lzfse(self, src, out_len=None):
++        """An LZFSE stream. Without a known size the buffer grows until the output fits."""
++        cap = out_len if out_len else max(len(src) * 8, 1 << 20)
++        while True:
++            dst = ctypes.create_string_buffer(cap + 1)
++            n = self.lz.lzfse_decode_buffer(dst, cap + 1, src, len(src), self.scratch)
++            if n <= cap:
++                return dst.raw[:n]
++            cap *= 2
++            if cap > 1 << 32:
++                raise apfs.ApfsError("lzfse: output too large")
++
++    def lzvn(self, src, out_len):
++        """A bare LZVN stream, wrapped as the one LZVN block of an LZFSE stream."""
++        hdr = struct.pack("<III", LZVN_MAGIC, out_len, len(src))
++        return self.lzfse(hdr + src + struct.pack("<I", END_MAGIC), out_len)[:out_len]
++
++    def zbitmap(self, src, out_len):
++        dst = ctypes.create_string_buffer(max(out_len, 1))
++        got = ctypes.c_size_t(0)
++        if self.zbm.zbm_decompress(dst, out_len, src, len(src), ctypes.byref(got)) != 0 or \
++                got.value != out_len:
++            raise apfs.ApfsError("LZBITMAP block does not decompress")
++        return dst.raw[:out_len]
++
++
++def install(codecs):
++    """Give apfs.py and dmg.py what they import as 'lzfse', and the decmpfs types they lack."""
++    mod = types.ModuleType("lzfse")
++    mod.decompress = lambda src: codecs.lzfse(bytes(src))
++    sys.modules["lzfse"] = mod
++
++    def one(ctype, piece, n):
++        if ctype in (7, 8):                  # LZVN: 0x06 in front means stored as it is
++            return piece[1:1 + n] if piece[:1] == b"\x06" else codecs.lzvn(piece, n)
++        return piece[1:1 + n] if piece[:1] == b"\xff" else codecs.zbitmap(piece, n)  # LZBITMAP
++
++    def table_fork(ctype, rsrc, usize):
++        # LZVN and LZBITMAP forks: le32 offsets of every block, and one more for the end (unzbm.c)
++        bs = apfs.DECMPFS_BLOCK_SIZE
++        blocks = (usize + bs - 1) // bs
++        if (blocks + 1) * 4 > len(rsrc):
++            raise apfs.ApfsError("block table does not fit in the resource fork")
++        out = bytearray()
++        for b in range(blocks):
++            fr, to = struct.unpack_from("<II", rsrc, 4 * b)
++            if fr > to or to > len(rsrc):
++                raise apfs.ApfsError("block %d out of range" % b)
++            out += one(ctype, rsrc[fr:to], min(bs, usize - b * bs))
++        return bytes(out)
++
++    old = apfs.Inode.decompress
++
++    def decompress(self, hdr):
++        _magic, ctype, usize = struct.unpack_from("<IIQ", hdr, 0)
++        if ctype in (7, 13):
++            return one(ctype, hdr[16:], usize)
++        if ctype in (8, 14):
++            rsrc = self.vol.xattr_bytes(self.obj_id, apfs.RSRC_FORK_XATTR_NAME, self.xattrs)
++            if rsrc is None:
++                raise apfs.ApfsError("inode %d: type %d but no resource fork" % (self.obj_id, ctype))
++            return table_fork(ctype, rsrc, usize)
++        return old(self, hdr)
++    apfs.Inode.decompress = decompress
++
++    # Sealed volumes (the cryptexes): file-system tree nodes carry no object header, so no
++    # checksum (the seal's hashes vouch for them instead); child links count from the root's identifier;
++    # and file extents
++    # live in a tree of their own, the fext tree, keyed (private id, logical offset).
++    old_get = apfs.Blocks.get
++
++    def get(self, addr, verify=True):
++        try:
++            return old_get(self, addr, verify)
++        except apfs.ApfsError:
++            b = self.raw(addr)
++            if len(b) == self.block_size and b[:32] == bytes(32) and \
++                    struct.unpack_from("<H", b, 32)[0] & apfs.BTNODE_NOHEADER:
++                self.cache[addr] = b
++                return b
++            raise
++    apfs.Blocks.get = get
++
++    def tree(self):
++        if self._tree is None:
++            self._tree = apfs.Btree(self.c.blocks, self.root_tree_oid,
++                                    resolve=self.omap.resolver(), name="fstree")
++            if self.sealed:
++                # a hashed tree names a child by its distance from the root's identifier: child
++                # n is object root+n in the object map (checked against the children's SHA-256s)
++                omap, root = self.omap, self.root_tree_oid
++                self._tree.resolve = lambda oid: omap.lookup(root + oid)
++        return self._tree
++    apfs.Volume.tree = property(tree)
++
++    old_extents = apfs.Volume.extents
++
++    def extents(self, stream_id):
++        if not self.sealed:
++            return old_extents(self, stream_id)
++        if getattr(self, "_fext", None) is None:
++            blk = self.c.blocks.get(self.addr)
++            self._fext = apfs.Btree(self.c.blocks, struct.unpack_from("<Q", blk, 1032)[0], name="fext")
++        out = []
++        for k, v in self._fext.iter_from(lambda k: struct.unpack_from("<QQ", k, 0) < (stream_id, 0)):
++            pid, logical = struct.unpack_from("<QQ", k, 0)
++            if pid != stream_id:
++                break
++            len_and_flags, phys = struct.unpack_from("<QQ", v, 0)
++            out.append((logical, len_and_flags & apfs.J_FILE_EXTENT_LEN_MASK, phys))
++        return out
++    apfs.Volume.extents = extents
++
++
++def long_path(p):
++    p = os.path.abspath(p)
++    if os.name == "nt" and not p.startswith("\\\\?\\"):
++        p = "\\\\?\\" + p
++    return p
++
++
++def write_file(vol, ino, dst):
++    hdr = ino.decmpfs
++    if hdr is not None and len(hdr) >= 16 and struct.unpack_from("<I", hdr, 0)[0] == apfs.DECMPFS_MAGIC:
++        data = ino.decompress(hdr)
++        with open(dst, "wb") as f:
++            f.write(data)
++        return len(data)
++    size = ino._dstream[0] if ino._dstream else 0
++    bs = vol.c.block_size
++    with open(dst, "wb") as f:
++        if size:
++            f.truncate(size)                 # holes read as zeros
++        for logical, length, phys in vol.extents(ino.private_id):
++            if logical >= size or phys == 0:
++                continue
++            n = min(length, size - logical)
++            f.seek(logical)
++            done = 0
++            while done < n:                  # 64 MB at a time
++                k = min(n - done, 64 << 20)
++                nb = (k + bs - 1) // bs
++                f.write(vol.c.blocks.raw(phys + done // bs, nb)[:k])
++                done += k
++    return size
++
++
++def main():
++    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
++    ap.add_argument("image")
++    ap.add_argument("outdir")
++    ap.add_argument("--dlls", required=True)
++    ap.add_argument("--only", default="")
++    ap.add_argument("--skip-name", action="append", default=[])
++    ap.add_argument("--skip", action="append", default=[])
++    ap.add_argument("--skip-glob", action="append", default=[])
++    ap.add_argument("--volume")
++    a = ap.parse_args()
++
++    install(Codecs(a.dlls))
++    c = apfs.Container(a.image)
++    vol = apfs.pick_volume(c, a.volume)
++    only = a.only.strip("/")
++    start = apfs.ROOT_DIR_INO_NUM
++    if only:
++        hit = vol.lookup(only)
++        if hit is None:
++            sys.exit("apfs-extract: %s: not in the image" % only)
++        start = hit[0]
++    skips = [s.strip("/") for s in a.skip]
++    out_root = long_path(a.outdir)
++    os.makedirs(out_root, exist_ok=True)
++    manifest = []
++    nfiles = nbytes = nlinks = nother = 0
++    prefix = only + "/" if only else ""
++
++    def visit(oid, rel):
++        nonlocal nfiles, nbytes, nlinks, nother
++        for name, fid, dt in sorted(vol.dir_entries(oid)):
++            r = rel + name
++            if name in a.skip_name or (prefix + r) in skips:
++                continue
++            ino = vol.inode(fid)
++            if ino is None:
++                continue
++            line = "%o\t%d\t%d\t%s" % (ino.mode, ino.owner, ino.group, r)
++            dst = os.path.join(out_root, *r.split("/"))
++            if dt == 4:
++                os.makedirs(dst, exist_ok=True)
++                manifest.append(line)
++                visit(fid, r + "/")
++            elif dt == 8:
++                if any(fnmatch.fnmatchcase(name, g) for g in a.skip_glob):
++                    continue
++                nbytes += write_file(vol, ino, dst)
++                nfiles += 1
++                manifest.append(line)
++                if nfiles % 500 == 0:
++                    print("  %d files, %.0f MB" % (nfiles, nbytes / 1e6), flush=True)
++            elif dt == 10:
++                t = ino.symlink_target_bytes() or b""
++                manifest.append(line + "\t" + t.decode("utf-8", "surrogateescape"))
++                nlinks += 1
++            else:
++                nother += 1
++
++    visit(start, "")
++    mpath = long_path(a.outdir.rstrip("\\/") + ".manifest")
++    with open(mpath, "w", encoding="utf-8", errors="surrogateescape", newline="\n") as f:
++        f.write("\n".join(manifest) + "\n")
++    print("apfs-extract: %d files (%.1f MB), %d symbolic links (in %s), %d others left out"
++          % (nfiles, nbytes / 1e6, nlinks, os.path.basename(mpath), nother))
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/sysimage/mkvarskel.py b/sysimage/mkvarskel.py
+index 70226e3..b1b96ec 100755
+--- a/sysimage/mkvarskel.py
++++ b/sysimage/mkvarskel.py
+@@ -13,6 +13,8 @@ import importlib.util
+ import os
+ import stat
+ import sys
++# LF lines on Windows too (a CRLF list made every /private/var directory with a carriage return in its name)
++sys.stdout.reconfigure(newline="\n")
+ 
+ here = os.path.dirname(os.path.abspath(__file__))
+ spec = importlib.util.spec_from_file_location('select_system', os.path.join(here, 'select-system.py'))
+diff --git a/sysimage/select-system.py b/sysimage/select-system.py
+index 68dfd85..6c87faa 100755
+--- a/sysimage/select-system.py
++++ b/sysimage/select-system.py
+@@ -203,7 +203,8 @@ def main():
+             chosen.add(path)
+ 
+     total = count = 0
+-    with open(files_out, 'w') as files, open(manifest_out, 'w') as manifest:
++    # LF on Windows too: CRLF put a carriage return at the end of every link target in the image
++    with open(files_out, 'w', newline='\n') as files, open(manifest_out, 'w', newline='\n') as manifest:
+         for path in sorted(chosen):
+             if path not in meta:
+                 continue
+diff --git a/tools/mk-jb-win.py b/tools/mk-jb-win.py
+new file mode 100644
+index 0000000..261df0b
+--- /dev/null
++++ b/tools/mk-jb-win.py
+@@ -0,0 +1,122 @@
++#!/usr/bin/env python3
++"""
++tools/mk-jb.sh for Windows (Git Bash, no WSL): the Procursus rootless bootstrap with Sileo in it, unpacked into jb/
++(never in the repository), as userland/build.sh takes it -- jb/root/var/jb -- plus what Windows cannot keep in a
++directory: jb/root/var/jb.manifest, one line per entry (mode in octal with the type bits, uid, gid, path relative to
++var/jb, and for a symbolic link its target), in the format of tools/apfs/mkapfs.py's manifests. userland/build.sh adds
++it to the system image's manifest, so the image gets the links (1151 in the bootstrap), the owners and the set-user-ID
++bits (login, su, sudo, passwd, ..., Sileo's giveMeRoot) that unpacking on NTFS loses.
++
++  python tools/mk-jb-win.py          (downloads into jb/debs once, like mk-jb.sh)
++
++Needs Python 3.14 (compression.zstd). The same sources and versions as mk-jb.sh.
++"""
++import io, os, shutil, stat, sys, tarfile, urllib.request
++
++SUITE = '1800'
++SILEO = 'org.coolstar.sileo_2.5.1_iphoneos-arm64.deb'
++MIRROR = 'https://apt.procurs.us'
++ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
++OUT = os.path.join(ROOT, 'jb')
++JB = os.path.join(OUT, 'root', 'var', 'jb')
++
++try:
++    from compression import zstd
++except ImportError:
++    sys.exit('mk-jb-win.py: needs Python 3.14 or newer (compression.zstd)')
++
++
++def get(url, name):
++    path = os.path.join(OUT, 'debs', name)
++    if not (os.path.exists(path) and os.path.getsize(path) > 0):
++        os.makedirs(os.path.dirname(path), exist_ok=True)
++        with urllib.request.urlopen(url) as r, open(path + '.part', 'wb') as f:
++            shutil.copyfileobj(r, f)
++        os.replace(path + '.part', path)
++    return path
++
++
++def ar_members(data):
++    """a .deb is an ar archive: {name: bytes}"""
++    if data[:8] != b'!<arch>\n':
++        sys.exit('mk-jb-win.py: the .deb is not an ar archive')
++    at, out = 8, {}
++    while at + 60 <= len(data):
++        head = data[at:at + 60]
++        name = head[:16].decode().strip().rstrip('/')
++        size = int(head[48:58].decode().strip())
++        out[name] = data[at + 60:at + 60 + size]
++        at += 60 + size + (size & 1)
++    return out
++
++
++def open_tar(name, blob):
++    if name.endswith('.zst'):
++        return tarfile.open(fileobj=zstd.ZstdFile(io.BytesIO(blob)), mode='r|')
++    return tarfile.open(fileobj=io.BytesIO(blob), mode='r:*')
++
++
++def unpack(tar, manifest):
++    """every entry under var/jb into JB; what NTFS cannot hold into manifest {relative path: line}"""
++    for m in tar:
++        name = m.name[2:] if m.name.startswith('./') else m.name
++        name = name.rstrip('/')
++        rel = name[len('var/jb/'):] if name.startswith('var/jb/') else None
++        if not rel:
++            continue
++        if '..' in rel.split('/') or any(c in rel for c in ':*?"<>|\\'):
++            sys.exit('mk-jb-win.py: an entry Windows cannot hold: %s' % rel)
++        dest = os.path.join(JB, *rel.split('/'))
++        perm = m.mode & 0o7777
++        if m.isdir():
++            os.makedirs(dest, exist_ok=True)
++            manifest[rel] = '%o\t%d\t%d\t%s' % (stat.S_IFDIR | perm, m.uid, m.gid, rel)
++        elif m.issym():
++            if os.path.lexists(dest) and not os.path.isdir(dest):
++                os.remove(dest)
++            manifest[rel] = '%o\t%d\t%d\t%s\t%s' % (stat.S_IFLNK | 0o755, m.uid, m.gid, rel, m.linkname)
++        elif m.islnk():
++            target = m.linkname[2:] if m.linkname.startswith('./') else m.linkname
++            src = os.path.join(JB, *target[len('var/jb/'):].split('/'))
++            os.makedirs(os.path.dirname(dest), exist_ok=True)
++            shutil.copyfile(src, dest)
++            manifest[rel] = '%o\t%d\t%d\t%s' % (stat.S_IFREG | perm, m.uid, m.gid, rel)
++        elif m.isfile():
++            os.makedirs(os.path.dirname(dest), exist_ok=True)
++            with tar.extractfile(m) as f, open(dest, 'wb') as o:
++                shutil.copyfileobj(f, o)
++            manifest[rel] = '%o\t%d\t%d\t%s' % (stat.S_IFREG | perm, m.uid, m.gid, rel)
++
++
++def main():
++    boot = get('%s/bootstraps/%s/bootstrap-iphoneos-arm64.tar.zst' % (MIRROR, SUITE), 'bootstrap.tar.zst')
++    deb = get('%s/pool/main/iphoneos-arm64-rootless/%s/sileo/%s' % (MIRROR, SUITE, SILEO), 'sileo.deb')
++    shutil.rmtree(os.path.join(OUT, 'root'), ignore_errors=True)
++    os.makedirs(JB)
++    manifest = {}
++    with zstd.open(boot, 'rb') as f, tarfile.open(fileobj=f, mode='r|') as t:
++        unpack(t, manifest)
++    parts = ar_members(open(deb, 'rb').read())
++    data = [n for n in parts if n.startswith('data.tar')]
++    if not data:
++        sys.exit('mk-jb-win.py: the .deb has no data.tar')
++    with open_tar(data[0], parts[data[0]]) as t:
++        unpack(t, manifest)
++    app = os.path.join(JB, 'Applications', 'Sileo.app')
++    if not os.path.isdir(app):
++        sys.exit('mk-jb-win.py: no Sileo.app in the package')
++    # Sileo's root helper: set-user-ID root, as the package ships it (mk-jb.sh: chmod 4755)
++    rel = 'Applications/Sileo.app/giveMeRoot'
++    if rel not in manifest:
++        sys.exit('mk-jb-win.py: no giveMeRoot in Sileo.app')
++    manifest[rel] = '%o\t0\t0\t%s' % (stat.S_IFREG | 0o4755, rel)
++    with open(os.path.join(OUT, 'root', 'var', 'jb.manifest'), 'w', newline='\n') as f:
++        for rel in sorted(manifest):
++            f.write(manifest[rel] + '\n')
++    links = sum(1 for l in manifest.values() if l.startswith('12'))
++    setid = sorted(l.split('\t')[3] for l in manifest.values() if int(l.split('\t')[0], 8) & 0o6000)
++    print('mk-jb-win.py: %d entries (%d links) in %s; set-ID: %s' % (len(manifest), links, JB, ', '.join(setid)))
++
++
++if __name__ == '__main__':
++    main()
+diff --git a/userland/build.sh b/userland/build.sh
+index c604123..0647ae9 100755
+--- a/userland/build.sh
++++ b/userland/build.sh
+@@ -80,10 +80,42 @@
+ #   CHECK=1          check every image (every container) as it is made: apfsck has to find it clean and
+ #                    the kernel's apfs_lib has to read every volume back as the directory it was made of
+ #                    (../tools/apfs/check-image.sh; the system image takes a few minutes more)
++#   PREBUILT_DIR=... with PREBUILT=1: take the programs from there instead (a CI build's, say)
++#   COMPILE_ONLY=1   compile the programs into obj/ and stop: no Darwin file is read or needed (with an empty
++#                    ../sysimage/rootfs/usr/lib the dynamically linked ones too). For a CI runner that has the
++#                    toolchain but must not have Apple's files; the images are then made elsewhere with PREBUILT_DIR.
++#
++# On Windows (Git Bash, no WSL) the images are made with PREBUILT=1. Git Bash cannot make a symbolic link,
++# so `ln -s` notes each one in obj/winlinks.tsv and mkapfs.py (MKAPFS_LINKS) puts it into the image; the
++# links of an unpacked cryptex come from its .manifest (../sysimage/apfs-extract.py).
+ set -e
+ # a copy of a tree that shares its files' data: hard links (Linux), clones of the files (macOS's APFS, whose cp has no -l)
+-linkcopy() { if [ "$(uname)" = Darwin ]; then cp -cRp "$1" "$2"; else cp -al "$1" "$2"; fi; }
++linkcopy() {
++	if [ "$(uname)" = Darwin ]; then cp -cRp "$1" "$2"; else cp -al "$1" "$2"; fi
++	if [ -n "$MKAPFS_LINKS" ] && [ -f "$1.manifest" ]; then
++		awk -F'\t' -v d="$(cd "$2" && pwd -W)" '$1 ~ /^12/ { print d "/" $4 "\t" $5 }' "$1.manifest" >> "$MKAPFS_LINKS"
++	fi
++}
+ cd "$(dirname "$(readlink -f "$0")")"
++case "$(uname)" in
++MINGW*|MSYS*|CYGWIN*)
++	mkdir -p obj
++	export MKAPFS_LINKS=$(pwd -W)/obj/winlinks.tsv
++	rm -f "$MKAPFS_LINKS"
++	ln() {
++		local s= f= a
++		while [ "${1#-}" != "$1" ]; do
++			case "$1" in *s*) s=1 ;; esac
++			case "$1" in *f*) f=1 ;; esac
++			shift
++		done
++		if [ -z "$s" ]; then command ln ${f:+-f} "$@"; return; fi
++		[ -z "$f" ] || rm -f "$2"
++		a="$(cd "$(dirname "$2")" && pwd -W)/$(basename "$2")"
++		printf '%s\t%s\n' "$a" "$1" >> "$MKAPFS_LINKS"
++	}
++	;;
++esac
+ source ../xnu-env.sh
+ 
+ CC="xnu-clang -arch arm64 -Os -static -nostdlib -ffreestanding -fno-stack-protector -fno-builtin -Wall -Wextra"
+@@ -142,8 +174,8 @@ mkdir -p obj
+ 
+ if [ -z "$PREBUILT" ] && ! command -v ld64 >/dev/null; then PREBUILT=1; fi
+ if [ -n "$PREBUILT" ]; then
+-	echo "build.sh: not compiling, using the programs in prebuilt/userland"
+-	for f in ../prebuilt/userland/*; do
++	echo "build.sh: not compiling, using the programs in ${PREBUILT_DIR:-prebuilt/userland}"
++	for f in ${PREBUILT_DIR:-../prebuilt/userland}/*; do
+ 		# keep a file that did not change (and its time stamp): system.apfs depends on stage0
+ 		cmp -s "$f" "obj/$(basename "$f")" || cp "$f" obj/
+ 	done
+@@ -198,6 +230,7 @@ if [ -d $DARWIN/rootfs/usr/lib ]; then
+ 		$DYN -framework CoreFoundation -o obj/svc_test src/svc_test.c
+ 		$DYN -Wno-four-char-constants -framework CoreFoundation -framework IOSurface -o obj/surf_test src/surf_test.c
+ 		$DYN -o obj/rwtouch src/rwtouch.c
++		$DYN -o obj/rwremote src/rwremote.c
+ 		$DYN -framework CoreFoundation -framework AudioToolbox -framework AVFoundation -lobjc -o obj/sound_test src/sound_test.c
+ 		$DYN -framework CoreFoundation -lMobileGestalt -o obj/mg_test src/mg_test.c
+ 		$DYN -framework CoreFoundation -framework AVFoundation -lobjc -o obj/torch_test src/torch_test.c
+@@ -212,6 +245,8 @@ if [ -d $DARWIN/rootfs/usr/lib ]; then
+ 		$DYN -o obj/cputop src/cputop.c
+ 		$DYN -framework CoreFoundation -framework IOSurface -o obj/cow_test src/cow_test.c
+ 		$DYN -framework CoreFoundation -framework CoreGraphics -framework IOSurface -o obj/cg_test src/cg_test.c
++		# the Galaxy S20's Mali given a job through HakiosGPU's Panfrost requests, without Mesa (src/mali_test.c)
++		$DYN -framework CoreFoundation -framework IOKit -o obj/mali_test src/mali_test.c
+ 		# what Darwin here believes about Metal, and what CoreImage does without it (src/metal_test.m);
+ 		# OpenGLES for the CIContext made over an EAGLContext, which is deprecated and the point
+ 		$DYN -fobjc-arc -Wno-deprecated-declarations -framework Foundation -framework CoreGraphics \
+@@ -344,11 +379,14 @@ if [ -d $DARWIN/rootfs/usr/lib ]; then
+ 			fi
+ 		fi
+ 	fi
++	if [ -n "$COMPILE_ONLY" ]; then echo "build.sh: compiled into obj/ (COMPILE_ONLY)"; exit 0; fi
+ 	cp obj/hello_dyn obj/svc_test obj/surf_test obj/rwtouch obj/mg_test root/bin/
+ 	[ -f obj/cpu_test ] && cp obj/cpu_test root/bin/        # (a prebuilt/ from before this program has none)
+ 	[ -f obj/cputop ] && cp obj/cputop root/bin/
++	[ -f obj/rwremote ] && cp obj/rwremote root/bin/      # touches from the computer (rc.jobs.remote)
+ 	[ -f obj/cow_test ] && cp obj/cow_test root/bin/
+ 	[ -f obj/cg_test ] && cp obj/cg_test root/bin/
++	[ -f obj/mali_test ] && cp obj/mali_test root/bin/
+ 	[ -f obj/shm_test ] && cp obj/shm_test root/bin/
+ 	[ -f obj/apfs_mmap_test ] && cp obj/apfs_mmap_test root/bin/
+ 	[ -f obj/vol_ls ] && cp obj/vol_ls root/bin/
+@@ -708,6 +746,15 @@ if [ -f $DARWIN/system.manifest ] && [ -f $CACHE/dyld_shared_cache_arm64 ] &&
+ 	if [ -d ../jb/root/var/jb ]; then
+ 		rm -rf sysroot/jb
+ 		cp -a ../jb/root/var/jb sysroot/jb
++		# Windows (tools/mk-jb-win.py): the prefix's links, owners and set-user-ID bits, which the copy on NTFS
++		# could not keep, go into the image through its manifest -- for /jb and for the applications copied below
++		if [ -f ../jb/root/var/jb.manifest ]; then
++			{ tr -d '\r' < $DARWIN/system.manifest
++			  awk -F'\t' 'BEGIN { OFS = "\t" } { $4 = "jb/" $4; print }' ../jb/root/var/jb.manifest
++			  awk -F'\t' '$4 ~ /^Applications\// { print }' ../jb/root/var/jb.manifest
++			} > obj/system-jb.manifest
++			SYSTEM_MANIFEST=obj/system-jb.manifest
++		fi
+ 		# the applications of the prefix are system applications here: LaunchServices builds its
+ 		# database afresh at every boot by walking /Applications, which is how their icons appear
+ 		for app in sysroot/jb/Applications/*.app; do
+@@ -746,7 +793,7 @@ if [ -f $DARWIN/system.manifest ] && [ -f $CACHE/dyld_shared_cache_arm64 ] &&
+ 	done
+ 	# zlib where it saves room, as Apple keeps the root (a small file whole in its attribute): 5.4 GB of
+ 	# files in 2.5 GB, what fits into the phone's RAM beside Darwin
+-	python3 ../tools/apfs/mkapfs.py -z -o system.apfs System=sysroot,manifest=$DARWIN/system.manifest | tail -1
+-	[ -z "$CHECK" ] || ../tools/apfs/check-image.sh system.apfs System=sysroot,manifest=$DARWIN/system.manifest
++	python3 ../tools/apfs/mkapfs.py -z -o system.apfs System=sysroot,manifest=${SYSTEM_MANIFEST:-$DARWIN/system.manifest} | tail -1
++	[ -z "$CHECK" ] || ../tools/apfs/check-image.sh system.apfs System=sysroot,manifest=${SYSTEM_MANIFEST:-$DARWIN/system.manifest}
+ 	rm -rf sysroot
+ fi
+diff --git a/userland/mkjobs.py b/userland/mkjobs.py
+index c3710e5..8a3d676 100755
+--- a/userland/mkjobs.py
++++ b/userland/mkjobs.py
+@@ -226,6 +226,9 @@ DENY = ('watchdog', 'CommCenter', 'wifi', 'WiFi', 'bluetooth', 'BTServer', 'loca
+ 
+ # ALLOW="word ..." in the environment lets jobs through that DENY would stop: for trying one out
+ DENY = tuple(word for word in DENY if word not in os.environ.get('ALLOW', '').split())
++# DENY_MORE="word ..." stops more for one image: the Galaxy S20's runs 100-101, where logd_helper (converting log
++# directories it takes for an older system's) took 80-84% of a core all the time, more than SpringBoard
++DENY = DENY + tuple(os.environ.get('DENY_MORE', '').split())
+ 
+ args = sys.argv[1:]
+ rest = '--rest' in args
+diff --git a/userland/rc.jobs.s20bench b/userland/rc.jobs.s20bench
+new file mode 100644
+index 0000000..2eef80a
+--- /dev/null
++++ b/userland/rc.jobs.s20bench
+@@ -0,0 +1,11 @@
++# Commands run by the launchd job com.hakios.demo (see com.hakios.demo.plist).
++# The Galaxy S20's frame-rate benchmark (RC_JOBS=rc.jobs.s20bench; runs of XL_SECS=300): the home screen comes some
++# three minutes after the start there, so: the lock screen swiped away at 150 s (nothing happens if there is none),
++# 15 s for the widgets, then the same round four times -- home-screen pages swiped there and back twice, Search pulled
++# down and closed, Settings opened from its icon, its list scrolled, the home button -- so that runs with and without
++# a change can be compared by MiniIOMobileFramebuffer's frames a second and "from one frame to the next" lines.
++/redwood/bin/rwtouch wait 150 swipe 0.5 0.985 0.5 0.3 200 wait 15
++/redwood/bin/rwtouch swipe 0.85 0.5 0.15 0.5 300 wait 1 swipe 0.15 0.5 0.85 0.5 300 wait 1 swipe 0.85 0.5 0.15 0.5 300 wait 1 swipe 0.15 0.5 0.85 0.5 300 wait 2 swipe 0.5 0.4 0.5 0.7 300 wait 2 button home wait 2 tap 0.615 0.71 wait 3 zigzag 0.5 0.75 0.35 500 3 wait 1 button home wait 3
++/redwood/bin/rwtouch swipe 0.85 0.5 0.15 0.5 300 wait 1 swipe 0.15 0.5 0.85 0.5 300 wait 1 swipe 0.85 0.5 0.15 0.5 300 wait 1 swipe 0.15 0.5 0.85 0.5 300 wait 2 swipe 0.5 0.4 0.5 0.7 300 wait 2 button home wait 2 tap 0.615 0.71 wait 3 zigzag 0.5 0.75 0.35 500 3 wait 1 button home wait 3
++/redwood/bin/rwtouch swipe 0.85 0.5 0.15 0.5 300 wait 1 swipe 0.15 0.5 0.85 0.5 300 wait 1 swipe 0.85 0.5 0.15 0.5 300 wait 1 swipe 0.15 0.5 0.85 0.5 300 wait 2 swipe 0.5 0.4 0.5 0.7 300 wait 2 button home wait 2 tap 0.615 0.71 wait 3 zigzag 0.5 0.75 0.35 500 3 wait 1 button home wait 3
++/redwood/bin/rwtouch swipe 0.85 0.5 0.15 0.5 300 wait 1 swipe 0.15 0.5 0.85 0.5 300 wait 1 swipe 0.85 0.5 0.15 0.5 300 wait 1 swipe 0.15 0.5 0.85 0.5 300 wait 2 swipe 0.5 0.4 0.5 0.7 300 wait 2 button home wait 2 tap 0.615 0.71 wait 3 zigzag 0.5 0.75 0.35 500 3 wait 1 button home wait 3
+diff --git a/userland/rc.jobs.s20prof b/userland/rc.jobs.s20prof
+new file mode 100644
+index 0000000..de4a55e
+--- /dev/null
++++ b/userland/rc.jobs.s20prof
+@@ -0,0 +1,8 @@
++# Commands run by the launchd job com.hakios.demo (see com.hakios.demo.plist).
++# rc.jobs.s20bench with cputop beside it: the S20's benchmark rounds and which processes take the processors (every 5 s).
++/redwood/bin/cputop 5 &
++/redwood/bin/rwtouch wait 150 swipe 0.5 0.985 0.5 0.3 200 wait 15
++/redwood/bin/rwtouch swipe 0.85 0.5 0.15 0.5 300 wait 1 swipe 0.15 0.5 0.85 0.5 300 wait 1 swipe 0.85 0.5 0.15 0.5 300 wait 1 swipe 0.15 0.5 0.85 0.5 300 wait 2 swipe 0.5 0.4 0.5 0.7 300 wait 2 button home wait 2 tap 0.615 0.71 wait 3 zigzag 0.5 0.75 0.35 500 3 wait 1 button home wait 3
++/redwood/bin/rwtouch swipe 0.85 0.5 0.15 0.5 300 wait 1 swipe 0.15 0.5 0.85 0.5 300 wait 1 swipe 0.85 0.5 0.15 0.5 300 wait 1 swipe 0.15 0.5 0.85 0.5 300 wait 2 swipe 0.5 0.4 0.5 0.7 300 wait 2 button home wait 2 tap 0.615 0.71 wait 3 zigzag 0.5 0.75 0.35 500 3 wait 1 button home wait 3
++/redwood/bin/rwtouch swipe 0.85 0.5 0.15 0.5 300 wait 1 swipe 0.15 0.5 0.85 0.5 300 wait 1 swipe 0.85 0.5 0.15 0.5 300 wait 1 swipe 0.15 0.5 0.85 0.5 300 wait 2 swipe 0.5 0.4 0.5 0.7 300 wait 2 button home wait 2 tap 0.615 0.71 wait 3 zigzag 0.5 0.75 0.35 500 3 wait 1 button home wait 3
++/redwood/bin/rwtouch swipe 0.85 0.5 0.15 0.5 300 wait 1 swipe 0.15 0.5 0.85 0.5 300 wait 1 swipe 0.85 0.5 0.15 0.5 300 wait 1 swipe 0.15 0.5 0.85 0.5 300 wait 2 swipe 0.5 0.4 0.5 0.7 300 wait 2 button home wait 2 tap 0.615 0.71 wait 3 zigzag 0.5 0.75 0.35 500 3 wait 1 button home wait 3
+diff --git a/userland/src/hello.c b/userland/src/hello.c
+index 79e3305..ac23c12 100644
+--- a/userland/src/hello.c
++++ b/userland/src/hello.c
+@@ -162,6 +162,7 @@ start(void)
+ 	show_int(fd, "kern.hakios.soc_id");
+ 	show_int(fd, "kern.hakios.pmic_peripherals");
+ 	show_string(fd, "kern.hakios.thermal_sensors");
++	show_string(fd, "kern.hakios.exynos_thermal_zones");     /* the Galaxy S20's (exynos_thermal=1) */
+ 
+ 	/*
+ 	 * hello_wait=N: stay N seconds, and say once in five how warm the SoC is. Process 1 is not supposed to exit (doing so
+@@ -174,6 +175,7 @@ start(void)
+ 		if (second % 5 == 4) {
+ 			show_int(fd, "kern.hakios.thermal_max_mc");
+ 			show_string(fd, "kern.hakios.thermal_hottest");
++			show_string(fd, "kern.hakios.exynos_thermal_zones");
+ 		}
+ 	}
+ 
+diff --git a/userland/src/init.c b/userland/src/init.c
+index 6801ce2..30a5510 100644
+--- a/userland/src/init.c
++++ b/userland/src/init.c
+@@ -998,9 +998,22 @@ mount_writable(void)
+ 		 * application from there, and from /private/var not at all -- everything a package put in
+ 		 * /var/jb/Applications was "Unable to register", with nothing on the files even looked at.
+ 		 */
+-		/* the prefix is grafted anew at every boot: on the kept volume, last boot's goes first */
++		/*
++		 * On the kept volume the prefix of last boot stays as it is, with what was installed into it (the
++		 * Galaxy S20's data volume, devices/x1s/PLAN.md S5): dpkg's database in it says it is one. Anything
++		 * else there (a link, or a prefix without that database) goes, and the prefix is grafted anew.
++		 * jb_regraft=1 grafts anew whatever is there.
++		 */
++		int keep = 0;
++
+ 		if (var_kept && lstat(to, &st) == 0) {
+-			if ((st.st_mode & S_IFMT) == S_IFDIR) {
++			struct stat db;
++
++			keep = (st.st_mode & S_IFMT) == S_IFDIR &&
++			    stat("/private/var/jb/var/lib/dpkg/status", &db) == 0 && boot_arg("jb_regraft") == NULL;
++			if (keep) {
++				printf("  /var/jb kept from the boot before, with what was installed into it\n");
++			} else if ((st.st_mode & S_IFMT) == S_IFDIR) {
+ 				empty_tree(to, 0);
+ 				rmdir(to);
+ 			} else {
+@@ -1015,7 +1028,7 @@ mount_writable(void)
+ 				printf("  the prefix on /private/preboot/jb-rw: %s\n", strerror(errno));
+ 			}
+ 		}
+-		grafted = graft_tree(jb, to, 1, &dirs, &entries);
++		grafted = keep ? 1 : graft_tree(jb, to, 1, &dirs, &entries);
+ 
+ 		/*
+ 		 * All of it belongs to root, as it does on a phone, but for the user's corner of it: an

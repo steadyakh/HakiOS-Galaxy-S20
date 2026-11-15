@@ -50,7 +50,7 @@ Details, numbers and every test run are in [docs/PLAN.md](docs/PLAN.md).
 | Path | What |
 |---|---|
 | `devices/x1s/` | the S20: boot image packer, image build script, U-Boot (patch, device tree, menu, UFS driver), configs |
-| `patches/hakios-2.3.4-s20.patch` | every S20 change to HakiOS outside `devices/x1s` (kernel drivers, loader, Mesa glue, tools) |
+| `patches/` | every S20 change to HakiOS outside `devices/x1s`, split by area: kernel core, loader, GPU, display, touch, CPU/heat, storage, userland, build ([index](patches/README.md)) |
 | `patches/UPSTREAM_BASE` | the HakiOS commit the patch applies to |
 | `docs/PLAN.md` | the full log: phone facts, safety rules, every test and its result |
 
@@ -59,7 +59,7 @@ Details, numbers and every test run are in [docs/PLAN.md](docs/PLAN.md).
 ```sh
 git clone https://github.com/oosexgang/hakios-xnu-kernel hakios && cd hakios
 git checkout $(cat ../HakiOS-Galaxy-S20/patches/UPSTREAM_BASE)
-git apply ../HakiOS-Galaxy-S20/patches/hakios-2.3.4-s20.patch
+for p in ../HakiOS-Galaxy-S20/patches/*/*.patch; do git apply "$p"; done
 cp -r ../HakiOS-Galaxy-S20/devices/x1s devices/
 ```
 

@@ -1,0 +1,351 @@
+diff --git a/drivers/storage/hakios.ufs.c b/drivers/storage/hakios.ufs.c
+index c4b6686..919a5bc 100644
+--- a/drivers/storage/hakios.ufs.c
++++ b/drivers/storage/hakios.ufs.c
+@@ -89,6 +89,12 @@ extern void FlushPoC_DcacheRegion(vm_offset_t va, size_t length);   /* osfmk/arm
+  */
+ #define UFS_WRITE_FIRST    2042368ULL                  /* darwin's blocks of 4096 */
+ #define UFS_DARWIN_MIN     5242875ULL                  /* the first phone's darwin, in blocks of 4096 */
++/*
++ * Or the Galaxy S20's (x1s, devices/x1s/PLAN.md S5): userdata's first UFS_USERDATA_VOL blocks, the owner's 110 GB for
++ * iOS, offered by the loader with write_first 0 (xnuloader/loader.c, block_is_x1s_userdata); the data volume is
++ * /dev/ufs_userdata_data, those blocks and no more. The loader and the U-Boot under it hold the same window.
++ */
++#define UFS_USERDATA_VOL   26855468ULL                 /* 110,000,000,000 bytes in blocks of 4096 */
+ 
+ struct loader_block_part {
+ 	char name[36];
+@@ -215,6 +221,8 @@ static int ufs_var_busy_pid;
+ 
+ /* ufs_write=1 and the one partition it is for: everything else answers EROFS as it always did */
+ static int ufs_write_part = -1;
++static uint64_t ufs_wr_first = UFS_WRITE_FIRST, ufs_wr_end = ~0ULL;     /* the window in that partition, in its blocks */
++static const char *ufs_wr_name = "darwin";
+ static volatile bool ufs_write_busy;            /* a write of ours has this kernel's list out: not a failure */
+ static bool ufs_write_out, ufs_write_was_native;        /* the list is out for writing, and was in before */
+ static uint64_t ufs_writes, ufs_write_bytes, ufs_write_errors, ufs_write_refused;
+@@ -612,8 +620,8 @@ ufs_write(uint32_t op, uint32_t part, uint64_t offset, const uint8_t *src, uint6
+ 	if (len == 0 || offset % nbs != 0 || len % nbs != 0) {
+ 		return EINVAL;          /* whole blocks only: nothing is read before a write */
+ 	}
+-	if (offset / nbs < UFS_WRITE_FIRST || offset > ufs_part_bytes(part) ||
+-	    len > ufs_part_bytes(part) - offset) {
++	if (offset / nbs < ufs_wr_first || offset > ufs_part_bytes(part) ||
++	    len > ufs_part_bytes(part) - offset || offset / nbs >= ufs_wr_end || len / nbs > ufs_wr_end - offset / nbs) {
+ 		/* the Darwin volume, the cryptexes, and anything past the partition's end: never */
+ 		ufs_write_refused++;
+ 		return EROFS;
+@@ -688,7 +696,12 @@ ufs_is_data(dev_t dev)
+ static uint64_t
+ ufs_data_bytes(void)
+ {
+-	return ufs_part_bytes((uint32_t)ufs_write_part) - UFS_WRITE_FIRST * 4096;
++	uint64_t bytes = ufs_part_bytes((uint32_t)ufs_write_part);
++
++	if (ufs_wr_end != ~0ULL && ufs_wr_end * 4096 < bytes) {
++		bytes = ufs_wr_end * 4096;
++	}
++	return bytes - ufs_wr_first * 4096;
+ }
+ 
+ /*
+@@ -713,7 +726,7 @@ ufs_data_flush(void)
+ 	lck_mtx_lock(&ufs_write_mtx);
+ 	lck_mtx_lock(&ufs_lock);
+ 	/* one block in bounds, for the loader's checks; nothing of it is touched */
+-	error = ufshc_list_in() ? EIO : ufs_request(BLOCK_OP_FLUSH, (uint32_t)ufs_write_part, UFS_WRITE_FIRST, 1, NULL, NULL);
++	error = ufshc_list_in() ? EIO : ufs_request(BLOCK_OP_FLUSH, (uint32_t)ufs_write_part, ufs_wr_first, 1, NULL, NULL);
+ 	lck_mtx_unlock(&ufs_lock);
+ 	lck_mtx_unlock(&ufs_write_mtx);
+ 	return error;
+@@ -727,7 +740,7 @@ ufs_data_flush(void)
+ static int
+ ufs_data_io(bool write, uint64_t offset, uint8_t *p, uint64_t len)
+ {
+-	uint64_t base = UFS_WRITE_FIRST * 4096, size = ufs_data_bytes();
++	uint64_t base = ufs_wr_first * 4096, size = ufs_data_bytes();
+ 	uint8_t *bounce;
+ 	int error = 0;
+ 
+@@ -1768,17 +1781,44 @@ hakios_ufs_init(void)
+ 	if (PE_parse_boot_argn("ufs_write", &check, sizeof(check)) && check == 1) {
+ 		uint32_t offered = ufs_page->write_part_plus_one;
+ 
+-		if (offered == 0 || offered > ufs_parts || ufs_page->write_first != UFS_WRITE_FIRST) {
++		if (offered == 0 || offered > ufs_parts ||
++		    (ufs_page->write_first != UFS_WRITE_FIRST && ufs_page->write_first != 0)) {
+ 			printf("ufs: the loader offers no partition to write into (ufs_write=1 on its command "
+ 			    "line too, and a loader that knows about writes)\n");
+ 		}
+ 		for (uint32_t i = 0; offered != 0 && i < ufs_parts; i++) {
+ 			const char *why = NULL;
+ 
+-			if (strncmp((const char *)ufs_page->part[i].name, "darwin", 7) != 0) {
++			bool userdata = strncmp((const char *)ufs_page->part[i].name, "userdata", 9) == 0;
++
++			if (strncmp((const char *)ufs_page->part[i].name, "darwin", 7) != 0 && !userdata) {
++				continue;
++			}
++			if (userdata && i == offered - 1 && ufs_page->write_first == 0) {
++				/* the S20's: its first 110 GB, nothing else of it */
++				if (ufs_page->part[i].flags & BLOCK_PART_UNIT) {
++					why = "it is a whole logical unit, not the partition";
++				} else if (ufs_page->part[i].unit != 0) {
++					why = "it is not on the first logical unit";
++				} else if (ufs_page->part[i].blocks < UFS_USERDATA_VOL) {
++					why = "it is smaller than the 110 GB volume";
++				} else if (ufs_page->part[i].block_size != 4096) {
++					why = "its blocks are not 4096 bytes";
++				}
++				if (why != NULL) {
++					printf("ufs: userdata: no write will be asked for: %s\n", why);
++					continue;
++				}
++				ufs_write_part = (int)i;
++				ufs_wr_first = 0;
++				ufs_wr_end = UFS_USERDATA_VOL;
++				ufs_wr_name = "userdata";
++				continue;
++			}
++			if (userdata) {
+ 				continue;
+ 			}
+-			if (i != offered - 1) {
++			if (i != offered - 1 || ufs_page->write_first != UFS_WRITE_FIRST) {
+ 				why = "the loader offers another partition";
+ 			} else if (ufs_page->part[i].flags & BLOCK_PART_UNIT) {
+ 				why = "it is a whole logical unit, not the partition";
+@@ -1799,13 +1839,13 @@ hakios_ufs_init(void)
+ 			ufs_write_part = (int)i;
+ 		}
+ 		if (ufs_write_part >= 0) {
+-			printf("ufs: /dev/rufs_darwin takes writes, whole blocks from %llu on (%llu MB of it); "
+-			    "everything else of the storage is read only\n", UFS_WRITE_FIRST,
+-			    (ufs_page->part[ufs_write_part].blocks - UFS_WRITE_FIRST) * 4096 >> 20);
++			printf("ufs: /dev/rufs_%s takes writes, whole blocks %llu..%llu (%llu MB); "
++			    "everything else of the storage is read only\n", ufs_wr_name, ufs_wr_first,
++			    ufs_wr_first + ufs_data_bytes() / 4096 - 1, ufs_data_bytes() >> 20);
+ 			if (devfs_make_node(makedev(ufs_bmajor, UFS_DATA_MINOR), DEVFS_BLOCK, UID_ROOT, GID_OPERATOR, 0640,
+-			    "ufs_darwin_data") != NULL) {
+-				printf("ufs: /dev/ufs_darwin_data: the same %llu MB as a block device, for the data volume; "
+-				    "%s\n", ufs_data_bytes() >> 20, ufs_data_op() == BLOCK_OP_WRITE_FAST ?
++			    "ufs_%s_data", ufs_wr_name) != NULL) {
++				printf("ufs: /dev/ufs_%s_data: the same %llu MB as a block device, for the data volume; "
++				    "%s\n", ufs_wr_name, ufs_data_bytes() >> 20, ufs_data_op() == BLOCK_OP_WRITE_FAST ?
+ 				    "writes flushed when the file system asks" : "every write flushed and read back (an older loader)");
+ 			}
+ 		} else {
+diff --git a/tools/apfs/apfs.py b/tools/apfs/apfs.py
+index 8feb090..18ac719 100755
+--- a/tools/apfs/apfs.py
++++ b/tools/apfs/apfs.py
+@@ -176,12 +176,15 @@ def checksum_ok(block):
+ 
+ class RawImage:
+     def __init__(self, path):
+-        self.fd = os.open(path, os.O_RDONLY)
++        self.fd = os.open(path, os.O_RDONLY | getattr(os, "O_BINARY", 0))
+         self.size = os.lseek(self.fd, 0, os.SEEK_END)
+         self.path = path
+ 
+     def read(self, off, length):
+-        return os.pread(self.fd, length, off)
++        if hasattr(os, "pread"):
++            return os.pread(self.fd, length, off)
++        os.lseek(self.fd, off, os.SEEK_SET)         # Windows has no pread
++        return os.read(self.fd, length)
+ 
+     def close(self):
+         os.close(self.fd)
+diff --git a/tools/apfs/mkapfs.py b/tools/apfs/mkapfs.py
+index 2628f4a..54ab1b1 100755
+--- a/tools/apfs/mkapfs.py
++++ b/tools/apfs/mkapfs.py
+@@ -122,25 +122,68 @@ class Node:
+         self.oid = 0
+ 
+ 
++def _windows_mode(path, st):
++    """
++    Windows keeps no Unix permissions (every file reads as 0666): a directory is 0755, a file 0755 if it is a
++    program (Mach-O, fat or thin, or a script) and 0644 otherwise. A manifest still has the last word.
++    """
++    if stat.S_ISDIR(st.st_mode):
++        return stat.S_IFDIR | 0o755
++    with open(path, 'rb') as f:
++        head = f.read(4)
++    progs = (b'\xcf\xfa\xed\xfe', b'\xce\xfa\xed\xfe', b'\xca\xfe\xba\xbe', b'\xca\xfe\xba\xbf')
++    return stat.S_IFREG | (0o755 if head in progs or head[:2] == b'#!' else 0o644)
++
++
+ def read_tree(path, name=''):
+     st = os.lstat(path)
++    if os.name == 'nt' and (stat.S_ISDIR(st.st_mode) or stat.S_ISREG(st.st_mode)):
++        mode = _windows_mode(path, st)
++    else:
++        mode = st.st_mode
+     if stat.S_ISDIR(st.st_mode):
+-        node = Node(name, st.st_mode)
++        node = Node(name, mode)
+         for entry in sorted(os.listdir(path)):
+             child = read_tree(os.path.join(path, entry), entry)
+             if child is not None:
+                 node.children[entry] = child
+         return node
+     if stat.S_ISREG(st.st_mode):
+-        return Node(name, st.st_mode, source=path)
++        return Node(name, mode, source=path)
+     if stat.S_ISLNK(st.st_mode):
+         return Node(name, st.st_mode, target=os.fsencode(os.readlink(path)))
+     return None                         # device nodes, FIFOs, sockets: /dev is devfs
+ 
+ 
++def add_noted_links(root, top, listing):
++    """
++    The symbolic links of a build on Windows, where Git Bash cannot make them (userland/build.sh notes each
++    one instead): lines of "full path<TAB>target". Those below `top` become links of this tree, where it has
++    nothing by that name and the directory they go in is there.
++    """
++    top = os.path.normpath(os.path.abspath(top))
++    for raw in open(listing, 'rb'):
++        fields = raw.rstrip(b'\r\n').split(b'\t')
++        if len(fields) != 2:
++            continue
++        p = os.path.normpath(os.fsdecode(fields[0]))
++        # compared without regard to case (Windows paths), but the names keep theirs
++        if not os.path.normcase(p).startswith(os.path.normcase(top) + os.sep):
++            continue
++        parts = p[len(top) + 1:].split(os.sep)
++        node = root
++        for part in parts[:-1]:
++            node = node.children.get(part)
++            if node is None or not stat.S_ISDIR(node.mode):
++                break
++        else:
++            if parts[-1] not in node.children:
++                node.children[parts[-1]] = Node(parts[-1], stat.S_IFLNK | 0o755, target=fields[1])
++
++
+ def apply_manifest(root, manifest):
+     for raw in open(manifest, 'rb'):
+-        fields = raw.rstrip(b'\n').split(b'\t')
++        fields = raw.rstrip(b'\r\n').split(b'\t')      # (CR LF: a manifest written on Windows)
+         if len(fields) < 4 or not fields[3]:
+             continue
+         mode, uid, gid = int(fields[0], 8), int(fields[1]), int(fields[2])
+@@ -915,6 +958,8 @@ def main():
+         name, _, rest = spec.partition('=')
+         parts = rest.split(',')
+         root = read_tree(parts[0])
++        if os.environ.get('MKAPFS_LINKS') and os.path.exists(os.environ['MKAPFS_LINKS']):
++            add_noted_links(root, parts[0], os.environ['MKAPFS_LINKS'])
+         for opt in parts[1:]:
+             k, _, val = opt.partition('=')
+             if k == 'manifest':
+diff --git a/tools/mkdatavol-x1s.py b/tools/mkdatavol-x1s.py
+new file mode 100644
+index 0000000..b5ec076
+--- /dev/null
++++ b/tools/mkdatavol-x1s.py
+@@ -0,0 +1,101 @@
++#!/usr/bin/env python3
++"""The Galaxy S20's data volume (devices/x1s/PLAN.md S5): the pieces of an empty HFS Plus volume to write into the first
++110 GB of its userdata from TWRP, and the script that writes them.
++
++usage: mkdatavol-x1s.py VOLUME.hfs OUTDIR
++
++VOLUME.hfs is the whole volume as mkfs.hfsplus made it (26855468 blocks of 4096; made on Windows as a sparse file, so
++it takes no room: devices/x1s/README or PLAN.md S5). Only the blocks the new volume uses -- the volume header and its
++copy at the end, the allocation bitmap, the extents and catalog trees, the journal -- are written: what is in free
++space does not matter to HFS Plus. OUTDIR gets one file per run of used blocks, a list, and twrp-write.sh, which
++writes them with dd into /dev/block/by-name/userdata at their block and reads each back.
++"""
++import hashlib
++import os
++import struct
++import sys
++
++BS = 4096
++VOL_BLOCKS = 26855468                 # xnuloader/loader.c USERDATA_VOL_BLOCKS, drivers/storage/hakios.ufs.c UFS_USERDATA_VOL
++USERDATA_MIN_BYTES = VOL_BLOCKS * BS
++
++
++def used_blocks(img):
++    img.seek(1024)
++    vh = img.read(512)
++    sig, = struct.unpack('>H', vh[0:2])
++    if sig not in (0x482B, 0x4858):
++        sys.exit('mkdatavol-x1s.py: no HFS Plus volume header')
++    block_size, total = struct.unpack('>II', vh[40:48])
++    if block_size != BS or total != VOL_BLOCKS:
++        sys.exit('mkdatavol-x1s.py: the volume is %d blocks of %d, not %d of %d' % (total, block_size, VOL_BLOCKS, BS))
++    fork = vh[112:192]
++    extents = [struct.unpack('>II', fork[16 + 8 * i:24 + 8 * i]) for i in range(8)]
++    bitmap = bytearray()
++    for start, count in extents:
++        if count:
++            img.seek(start * BS)
++            bitmap += img.read(count * BS)
++    if len(bitmap) * 8 < total:
++        sys.exit('mkdatavol-x1s.py: the allocation file is in more pieces than its fork says')
++    runs = []
++    b = 0
++    while b < total:
++        byte = bitmap[b >> 3]
++        if byte == 0 and (b & 7) == 0:
++            b += 8
++            continue
++        if byte & (0x80 >> (b & 7)):
++            if runs and runs[-1][0] + runs[-1][1] == b:
++                runs[-1][1] += 1
++            else:
++                runs.append([b, 1])
++        b += 1
++    return runs
++
++
++def main():
++    if len(sys.argv) != 3:
++        sys.exit(__doc__)
++    vol, out = sys.argv[1], sys.argv[2]
++    os.makedirs(out, exist_ok=True)
++    lines = ['#!/system/bin/sh',
++             '# written by tools/mkdatavol-x1s.py: the empty data volume into the first 110 GB of userdata',
++             'set -e',
++             'cd "$(dirname "$0")"',
++             'dev=/dev/block/by-name/userdata',
++             'real=$(readlink -f $dev)',
++             'size=$(blockdev --getsize64 $real)',
++             'echo "userdata is $real, $size bytes"',
++             '[ "$size" -ge %d ] || { echo "userdata is smaller than the volume: nothing written"; exit 1; }' % USERDATA_MIN_BYTES,
++             'grep -q " /data " /proc/mounts && { echo "/data is mounted: unmount it first (umount /data)"; exit 1; }',
++             ]
++    total_bytes = 0
++    with open(vol, 'rb') as img:
++        runs = used_blocks(img)
++        listing = []
++        for first, count in runs:
++            img.seek(first * BS)
++            data = img.read(count * BS)
++            name = 'blk_%08d_%d.bin' % (first, count)
++            with open(os.path.join(out, name), 'wb') as f:
++                f.write(data)
++            sha = hashlib.sha256(data).hexdigest()
++            listing.append('%d %d %s %s' % (first, count, sha, name))
++            lines.append('dd if=%s of=$dev bs=4096 seek=%d count=%d conv=notrunc,fsync 2>/dev/null' % (name, first, count))
++            lines.append('[ "$(dd if=$dev bs=4096 skip=%d count=%d 2>/dev/null | sha256sum | cut -d" " -f1)" = %s ] '
++                         '|| { echo "block %d: read back differs"; exit 1; }' % (first, count, sha, first))
++            total_bytes += len(data)
++    lines.append('sync')
++    lines.append('echo "the data volume is written: %d pieces, %d bytes, each read back the same"' % (len(runs), total_bytes))
++    with open(os.path.join(out, 'twrp-write.sh'), 'w', newline='\n') as f:
++        f.write('\n'.join(lines) + '\n')
++    with open(os.path.join(out, 'pieces.txt'), 'w', newline='\n') as f:
++        f.write('\n'.join(listing) + '\n')
++    for l in listing:
++        print(l)
++    print('%s: %d pieces, %d bytes to write' % (out, len(runs), total_bytes))
++
++
++if __name__ == '__main__':
++    main()

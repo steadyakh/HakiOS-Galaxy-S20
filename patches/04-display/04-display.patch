@@ -1,0 +1,217 @@
+diff --git a/xnu/files/iokit/Kernel/MiniIOMobileFramebuffer.cpp b/xnu/files/iokit/Kernel/MiniIOMobileFramebuffer.cpp
+index 724e156..476f505 100644
+--- a/xnu/files/iokit/Kernel/MiniIOMobileFramebuffer.cpp
++++ b/xnu/files/iokit/Kernel/MiniIOMobileFramebuffer.cpp
+@@ -211,6 +211,19 @@ panel_thread_start(thread_continue_t continuation, void * parameter, thread_t *
+ SYSCTL_DECL(_kern_hakios);
+ static uint32_t gShownSurface;
+ SYSCTL_UINT(_kern_hakios, OID_AUTO, fb_surface, CTLFLAG_RD | CTLFLAG_LOCKED, &gShownSurface, 0, "the IOSurface last put on the panel");
++/*
++ * fb_gpuscale (default 1): the display (1125 x 2436) is stretched onto the panel (1440 x 3200 on the Galaxy S20) by the
++ * GPU, not here. The window server's OpenGL (userland/src/eagl.c) reads kern.hakios.fb_panel, the panel's size (width
++ * in the high 16 bits; 0: the display is the panel's size, or fb_gpuscale=0), and copies each frame it draws for the
++ * panel into a surface of that size made for it ("HakiosPanelTwinOf"), stretched, by the GPU; show() puts that one on
++ * the panel as it is -- a plain copy of rows, not every pixel worked out from the picture's (run 80: 3 ms a frame against
++ * 26 for the stretch here, 1440 x 3200 from 1125 x 2436, bilinear, three threads).
++ */
++static TUNABLE(uint32_t, gGpuScale, "fb_gpuscale", 1);
++/* Boot-arg fb_fps=1: the frames a second, in big white digits on black at the panel's top left, over every frame. */
++static TUNABLE(uint32_t, gFps, "fb_fps", 0);
++static uint32_t gPanelSize;
++SYSCTL_UINT(_kern_hakios, OID_AUTO, fb_panel, CTLFLAG_RD | CTLFLAG_LOCKED, &gPanelSize, 0, "the panel's size, for the GPU to stretch frames to");
+ 
+ #define SWAP_QUEUE              2                       /* frames that may wait for the panel at most (fb_queue) */
+ static TUNABLE(uint32_t, gQueue, "fb_queue", 2);
+@@ -437,6 +450,10 @@ public:
+ 	static void presenterMain(void * self, wait_result_t result);
+ 	void reportFrameTimes(void);
+ 	void drawLayer(MiniIOSurface * s, const int32_t * src, const int32_t * dst);
++	void drawLayerOrTwin(MiniIOSurface * s, const int32_t * src, const int32_t * dst);
++	void drawFps(uint64_t now);
++	uint64_t        fFpsSince;              /* fb_fps: when the frames counted below began */
++	uint32_t        fFpsCount, fFpsShown;   /* ... how many have come since, and the number on the panel */
+ 	void drawRows(const struct RowJob * job, int32_t y0, int32_t y1, uint32_t * blendRow);
+ 	static void helperMain(void * self, wait_result_t result);
+ 	static void beamProbeMain(void * self, wait_result_t result);
+@@ -631,6 +648,9 @@ IOMobileFramebuffer::start(IOService * provider)
+ 			}
+ 		}
+ 	}
++	if (gGpuScale != 0 && (fWidth != fPanelWidth || fHeight != fPanelHeight) && fPanelWidth < 65536 && fPanelHeight < 65536) {
++		gPanelSize = fPanelWidth << 16 | fPanelHeight;
++	}
+ 	fColumn = IONewZero(uint32_t, fPanelWidth);
+ 	fColumnWeight = IONewZero(uint16_t, fPanelWidth);
+ 	fDiff = gDiff != 0;
+@@ -1067,6 +1087,105 @@ IOMobileFramebuffer::beamShareDone(const struct RowJob * job, unsigned share, in
+ 	}
+ }
+ 
++/*
++ * fb_fps=1: the frames shown in the last half second, times two, drawn at the panel's top left (below the status bar)
++ * in a 3 x 5 font scaled up 10 times, after the frame's own pixels: it is in every frame and costs a few thousand pixels.
++ */
++void
++IOMobileFramebuffer::drawFps(uint64_t now)
++{
++	static const uint16_t digits[10] = { 0x7b6f, 0x2c97, 0x73e7, 0x73cf, 0x5bc9, 0x79cf, 0x79ef, 0x7249, 0x7bef, 0x7bcf };
++	const uint32_t scale = 10, x0 = 40, y0 = 160, w = 3 * 3 * scale + 2 * scale + 2 * scale, h = 5 * scale + 2 * scale;
++	uint64_t ns;
++	uint32_t value;
++	char text[4];
++	int n = 0;
++
++	fFpsCount++;
++	if (fFpsSince == 0) {
++		fFpsSince = now;
++	}
++	absolutetime_to_nanoseconds(now - fFpsSince, &ns);
++	if (ns >= 500 * NSEC_PER_MSEC) {
++		fFpsShown = (uint32_t) ((uint64_t) fFpsCount * NSEC_PER_SEC / ns);
++		fFpsCount = 0;
++		fFpsSince = now;
++	}
++	if (x0 + w + 4 * scale >= fPanelWidth || y0 + h >= fPanelHeight) {
++		return;
++	}
++	value = fFpsShown > 999 ? 999 : fFpsShown;
++	if (value >= 100) {
++		text[n++] = (char) (value / 100);
++	}
++	if (value >= 10) {
++		text[n++] = (char) (value / 10 % 10);
++	}
++	text[n++] = (char) (value % 10);
++	for (uint32_t y = y0; y < y0 + h; y++) {
++		uint32_t * row = (uint32_t *) (fBase + (size_t) y * fRowBytes);
++
++		for (uint32_t x = x0; x < x0 + w + 4 * scale; x++) {
++			row[x] = 0xff000000u;
++		}
++	}
++	for (int d = 0; d < n; d++) {
++		uint16_t glyph = digits[(int) text[d]];
++
++		for (uint32_t gy = 0; gy < 5; gy++) {
++			for (uint32_t gx = 0; gx < 3; gx++) {
++				if (!(glyph >> (14 - (gy * 3 + gx)) & 1)) {
++					continue;
++				}
++				for (uint32_t py = 0; py < scale; py++) {
++					uint32_t * row = (uint32_t *) (fBase + (size_t) (y0 + scale + gy * scale + py) * fRowBytes);
++
++					for (uint32_t px = 0; px < scale; px++) {
++						row[x0 + scale + (uint32_t) d * 4 * scale + gx * scale + px] = 0xffffffffu;
++					}
++				}
++			}
++		}
++	}
++}
++
++/*
++ * A layer onto the panel: from the surface the GPU has stretched it into (fb_gpuscale, see gPanelSize), if it has one
++ * and the whole surface goes onto the whole display; else from the surface itself, stretched here.
++ */
++void
++IOMobileFramebuffer::drawLayerOrTwin(MiniIOSurface * s, const int32_t * src, const int32_t * dst)
++{
++	static const int32_t all[4] = { 0, 0, 0, 0 };   /* (drawLayer: the whole surface, the whole display) */
++	static bool said;
++	MiniIOSurface * t;
++
++	if (gPanelSize == 0 || s->panelTwin == 0 ||
++	    !((src[2] <= 0 && src[3] <= 0) || (src[0] == 0 && src[1] == 0 && (uint32_t) src[2] == s->info.width && (uint32_t) src[3] == s->info.height)) ||
++	    !((dst[2] <= 0 && dst[3] <= 0) || (dst[0] == 0 && dst[1] == 0 && (uint32_t) dst[2] == fWidth && (uint32_t) dst[3] == fHeight)) ||
++	    (t = MiniIOSurfaceCopy(s->panelTwin)) == NULL) {
++		drawLayer(s, src, dst);
++		return;
++	}
++	if (t->twinOf != s->sid || t->info.width != fPanelWidth || t->info.height != fPanelHeight ||
++	    t->info.bytesPerElement != 4 || t->info.planeCount != 0 || t->drawn == 0) {
++		MiniIOSurfaceDrop(t);
++		drawLayer(s, src, dst);
++		return;
++	}
++	if (!MiniIOSurfaceDrawn(t, SWAP_GPU_MS)) {
++		IOLog("MiniIOMobileFramebuffer: the GPU is not done with surface %u (surface %u stretched) after %u ms; shown as it is\n",
++		    t->sid, s->sid, SWAP_GPU_MS);
++	}
++	if (!said) {
++		said = true;
++		IOLog("MiniIOMobileFramebuffer: surface %u stretched to the panel by the GPU, in surface %u (%ux%u): copied as it is\n",
++		    s->sid, t->sid, t->info.width, t->info.height);
++	}
++	drawLayer(t, all, all);
++	MiniIOSurfaceDrop(t);
++}
++
+ /*
+  * Put a rectangle of a 32-bit surface on the screen. `dst` is in display coordinates; the
+  * panel may be of another size, and the layer itself may be scaled: both are done in one
+@@ -1417,7 +1536,7 @@ IOMobileFramebuffer::settle(const uint8_t * swap, MiniIOSurface ** surfaces)
+ 		}
+ 		memcpy(src, swap + SWAP_SOURCE(layer), sizeof(src));
+ 		memcpy(dst, swap + SWAP_DEST(layer), sizeof(dst));
+-		drawLayer(s, src, dst);
++		drawLayerOrTwin(s, src, dst);
+ 	}
+ 	fSettling = false;
+ 	fStatSettled++;
+@@ -1536,13 +1655,16 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
+ 				fGraphics = true;
+ 				PE_initialize_console(NULL, kPEGraphicsMode);
+ 			}
+-			drawLayer(s, src, dst);
++			drawLayerOrTwin(s, src, dst);
+ 			if (layer == 0) {
+ 				recorded = s;   /* (recorded once the frame is in the panel's memory: see below) */
+ 				gShownSurface = sid;
+ 			}
+ 		}
+ 	}
++	if (gFps != 0 && fGraphics) {
++		drawFps(mach_absolute_time());
++	}
+ 	drawn = mach_absolute_time();
+ 	if (recorded != NULL) {
+ 		record(recorded);
+diff --git a/xnu/files/iokit/Kernel/MiniIOSurface.cpp b/xnu/files/iokit/Kernel/MiniIOSurface.cpp
+index 5413c2b..8f05419 100644
+--- a/xnu/files/iokit/Kernel/MiniIOSurface.cpp
++++ b/xnu/files/iokit/Kernel/MiniIOSurface.cpp
+@@ -712,6 +712,17 @@ surfaceCreate(OSDictionary * props, IOReturn * error)
+ 	info->traceID = sid;
+ 	gSurfaceTable[sid] = s;                 /* the table owns the object until the last holder goes */
+ 	gSurfaceCount++;
++	{
++		/* the panel-sized picture of another surface's frames (fb_gpuscale): that one is told of it */
++		uint32_t of = dictNumber(props, "HakiosPanelTwinOf", 0);
++
++		s->panelTwin = 0;
++		s->twinOf = 0;
++		if (of != 0 && of != sid && of < MINISURF_TABLE_SIZE && gSurfaceTable[of] != NULL) {
++			s->twinOf = of;
++			gSurfaceTable[of]->panelTwin = sid;
++		}
++	}
+ 	gSurfaceBytes += alloc;
+ 
+ 	struct minisurf_shared * sh = s->shared();
+diff --git a/xnu/files/iokit/Kernel/MiniIOSurface.h b/xnu/files/iokit/Kernel/MiniIOSurface.h
+index 30539e5..fffa458 100644
+--- a/xnu/files/iokit/Kernel/MiniIOSurface.h
++++ b/xnu/files/iokit/Kernel/MiniIOSurface.h
+@@ -124,6 +124,12 @@ public:
+ 	uint32_t                        useCount[2];
+ 	uint32_t                        purgeable;
+ 	bool                            traced;         /* made by a program of boot-arg surftrace_of: its ports are said too */
++	/*
++	 * fb_gpuscale: a surface of the panel's own size that the GPU stretches this one's frames into (eagl.c), and,
++	 * in that one, whose it is (IOSurfaceCreate's "HakiosPanelTwinOf"). 0: none.
++	 */
++	uint32_t                        panelTwin;
++	uint32_t                        twinOf;
+ 
+ 	virtual bool
+ 	init(void) APPLE_KEXT_OVERRIDE

@@ -1,0 +1,1490 @@
+diff --git a/xnuloader/build.sh b/xnuloader/build.sh
+index d8e696a..482ab29 100755
+--- a/xnuloader/build.sh
++++ b/xnuloader/build.sh
+@@ -6,7 +6,7 @@ cd "$(dirname "$0")"
+ [ -f identity.h ] || ./mkidentity.sh
+ 
+ clang --target=aarch64-unknown-windows -ffreestanding -fno-builtin -fno-stack-protector -fshort-wchar \
+-  -mgeneral-regs-only -O1 -Wall -Wextra -Wno-unused-parameter -c loader.c -o loader.obj
++  -mgeneral-regs-only -O1 ${LOADER_CFLAGS:-} -Wall -Wextra -Wno-unused-parameter -c loader.c -o loader.obj
+ # /base: UEFI loads an image at its preferred address when that is free. The PE default (0x140000000)
+ # is in the middle of the phone's largest block of RAM, which XNU needs in one piece.
+ lld-link /subsystem:efi_application /entry:efi_main /nodefaultlib /base:0xA1000000 /out:loader.efi loader.obj
+diff --git a/xnuloader/loader.c b/xnuloader/loader.c
+index 422f9d3..272575e 100644
+--- a/xnuloader/loader.c
++++ b/xnuloader/loader.c
+@@ -15,7 +15,12 @@
+ /* ------------------------------------------------------------------------ */
+ /* Fixed conventions shared with the boot shim, the packer and the kernel   */
+ 
+-#define PAYLOAD_BASE        0xF0000000ULL
++/*
++ * Where the payload sits: 0xF0000000 on the Qualcomm phones and QEMU, the platform's own elsewhere (on the
++ * Galaxy S20, 0xF0000000 is the modem's and the framebuffer's). Set from the platform before anything reads it.
++ */
++static uint64_t payload_base = 0xF0000000ULL;
++#define PAYLOAD_BASE        payload_base
+ #define PAYLOAD_MAGIC       0x50554E58u /* "XNUP" */
+ 
+ struct payload_header { uint32_t magic; uint32_t size; };
+@@ -344,15 +349,31 @@ static int hc_log_skips;                /* logs not written this run (said twice
+ static void hc_print_state(const char *when);
+ static void hc_take_back(const char *when);
+ 
++/*
++ * The kernel log of the last run, for "oem log" once the run is over: it stays where the kernel left it until the next
++ * run. Without it, "oem log" after a run had only the loader's own 32 KB log_buf to give.
++ */
++static const char *last_klog;
++static uint64_t last_klog_len;
++static int klog_on_console = 1;         /* QEMU only, once the platform is known (efi_main) */
++
+ static void
+ write_logs(const char *klog, uint64_t klog_len)
+ {
+ 	efi_block_io *bio = find_log_partition();
+ 
++	if (klog != NULL) {
++		last_klog = klog;
++		last_klog_len = klog_len;
++	}
+ 	compose_logs(klog, klog_len);
+ 	if (bio == NULL) {
+-		/* No log partition (QEMU): echo the returned kernel log on the console instead. */
+-		if (klog != NULL) {
++		/*
++		 * No log partition. QEMU: echo the returned kernel log on the console instead. A phone without one (the S20,
++		 * whose storage the loader never writes): the host fetches it over USB; echoed, it filled log_buf, the copy
++		 * the host got stopped at 32 KB, and there was no room left for any answer printed into log_buf ("getvar screen").
++		 */
++		if (klog != NULL && klog_on_console) {
+ 			print("\n== KERNEL LOG ==\n");
+ 			for (uint64_t i = 0; i < klog_len; i++) {
+ 				put_char(klog[i]);
+@@ -553,14 +574,20 @@ dt_end(struct dt_writer *w)
+ struct platform {
+ 	const char *name;
+ 	uint64_t io_base, io_size;       /* one window covering the SoC peripherals */
+-	uint64_t gic_dist, gic_redist;   /* GICv3 */
++	uint64_t gic_dist, gic_redist;   /* GICv3; for a GICv2 gic_redist is 0 and gic_cpu is set */
++	uint64_t gic_cpu;                /* GICv2 CPU interface, 0 for a GICv3 */
++	uint64_t fb_base;                /* the framebuffer the firmware hands over: how the loader knows the phone */
++	uint64_t payload_base;           /* 0: 0xF0000000 */
++	uint32_t timer_hz;               /* the generic timer's rate when the firmware leaves CNTFRQ_EL0 unset; 0: CNTFRQ_EL0 */
+ 	uint64_t uart;                   /* PL011, 0 if none */
+ 	int psci_hvc;                    /* the firmware's power interface is called with HVC, not SMC */
+ 	int log_other_cpu;               /* keep notes in the log partition while a kernel starts on another core */
+ 	int cores;                       /* at most this many processor cores, numbered from 0 ... */
+ 	int core_shift;                  /* ... in this bit of MPIDR: the phone numbers them in the second affinity field */
++	int psci_shift;                  /* the firmware's number for a core is its MPIDR shifted down this far (PSCI) */
+ 	uint32_t timeout_scale;          /* a kernel on several cores gets this much longer to wait for a lock, 0: as it is */
+ 	uint32_t small_cores;            /* a bit for each of the slower cores, by number: "small-core" in the device tree */
++	uint32_t extra_mpidr[2];         /* cores numbered otherwise, given only with boot-arg mongoose=1 (the S20's M5s) */
+ };
+ 
+ static const struct platform platform_qemu_virt = {
+@@ -586,8 +613,42 @@ static const struct platform platform_redwood = {
+ 	 * (XNU's machine_routines.c, ml_choose_slow_core_partners()).
+ 	 */
+ 	.small_cores = 0x0f,
++	.fb_base = 0xE1000000,
+ };
+ 
++static const struct platform platform_x1s = {
++	/*
++	 * Samsung Galaxy S20 5G (SM-G981B, Exynos 990), started by HakiOS's U-Boot (devices/x1s/u-boot). The peripherals are
++	 * 0x10000000-0x1FFFFFFF; the GIC is a GIC-400 (v2). PSCI by SMC, as Samsung's own device tree says. S-BOOT leaves
++	 * CNTFRQ_EL0 unset: the timer runs from the 26 MHz oscillator.
++	 */
++	.name = "x1s", .io_base = 0x10000000, .io_size = 0x10000000,
++	.gic_dist = 0x10101000, .gic_redist = 0, .gic_cpu = 0x10102000, .uart = 0, .log_other_cpu = 0,
++	/*
++	 * Cores 0-3 are Cortex-A55s, 4-5 Cortex-A76s. The two Mongoose M5s (MPIDR 0x10000, 0x10100; the firmware's 0x100,
++	 * 0x101) are the hottest: they are the kernel's only with boot-arg mongoose=1, now that it reads the temperature
++	 * (exynos_thermal: the BIG zone, power off at 70 C; devices/x1s/PLAN.md).
++	 * Two numberings (seen in TWRP's Linux, 12 Nov): a core's own MPIDR has its number in Affinity1 (0x100-0x500,
++	 * the Mongooses 0x10000/0x10100), but the firmware (PSCI) and Samsung's device tree number them 1-5 (0x100/0x101).
++	 * The kernel finds its cpu data by MPIDR, so it gets the MPIDRs, and PSCI calls shift them down (psci_shift).
++	 */
++	.cores = 6, .core_shift = 8, .psci_shift = 8,
++	.small_cores = 0x0f,
++	.extra_mpidr = { 0x10000, 0x10100 },
++	/*
++	 * PSCI by HVC: the device tree S-BOOT hands over (Samsung's, with this board's overlay) says method = "hvc" -- the
++	 * calls go to Samsung's hypervisor H-Arx, which runs at EL2. By SMC no core but the first ever started (runs 22, 23:
++	 * "1 of 6 processors are running"), and PSCI SYSTEM_OFF came back.
++	 */
++	.psci_hvc = 1,
++	.fb_base = 0xF1000000,
++	.payload_base = 0xC8000000,
++	.timer_hz = 26000000,
++};
++
++/* every phone the loader knows, by the framebuffer its firmware hands over */
++static const struct platform *const known_platforms[] = { &platform_redwood, &platform_x1s };
++
+ /* ------------------------------------------------------------------------ */
+ 
+ static void
+@@ -625,6 +686,12 @@ enum {
+ uint64_t loader_ctx[CTX_COUNT];
+ int loader_save_ctx(void);
+ void loader_return_stub(void);
++/*
++ * Whether the processor's GICv3 system registers (ICC_*) may be touched: not on a GICv2 phone (the
++ * Galaxy S20), where below Samsung's hypervisor every access is an undefined instruction (seen: the
++ * jump into the kernel stopped at the first one, ESR 0x02000000). Set from the platform in efi_main.
++ */
++uint32_t loader_has_icc = 1;
+ 
+ __asm__ (
+         ".text\n"
+@@ -654,10 +721,14 @@ __asm__ (
+         "  mrs x9, mdscr_el1\n     str x9, [x10, #320]\n"
+         "  mrs x9, s3_3_c4_c4_0\n          str x9, [x10, #328]\n"
+         "  mrs x9, s3_3_c4_c4_1\n          str x9, [x10, #336]\n"
+-        /* GICv3 CPU interface: the kernel reprograms it for its own interrupts */
++        /* GICv3 CPU interface: the kernel reprograms it for its own interrupts (none on a GICv2: loader_has_icc) */
++        "  adrp x11, loader_has_icc\n"
++        "  ldr  w11, [x11, :lo12:loader_has_icc]\n"
++        "  cbz  w11, 3f\n"
+         "  mrs x9, icc_pmr_el1\n     str x9, [x10, #344]\n"
+         "  mrs x9, icc_igrpen1_el1\n str x9, [x10, #352]\n"
+         "  mrs x9, icc_bpr1_el1\n    str x9, [x10, #360]\n"
++        "3:\n"
+         "  mrs x9, spsel\n"
+         "  cbz x9, 1f\n"                  /* SP_EL0 is only accessible while running on SP_EL1 */
+         "  mrs x9, sp_el0\n        str x9, [x10, #304]\n"
+@@ -714,9 +785,13 @@ __asm__ (
+         "  ldr x9, [x10, #296]\n msr tpidrro_el0, x9\n"
+         "  ldr x9, [x10, #312]\n msr contextidr_el1, x9\n"
+         "  ldr x9, [x10, #320]\n msr mdscr_el1, x9\n"
++        "  adrp x11, loader_has_icc\n"
++        "  ldr  w11, [x11, :lo12:loader_has_icc]\n"
++        "  cbz  w11, 3f\n"
+         "  ldr x9, [x10, #344]\n msr icc_pmr_el1, x9\n"
+         "  ldr x9, [x10, #360]\n msr icc_bpr1_el1, x9\n"
+         "  ldr x9, [x10, #352]\n msr icc_igrpen1_el1, x9\n"
++        "3:\n"
+         "  ldr x9, [x10, #328]\n msr s3_3_c4_c4_0, x9\n"
+         "  ldr x9, [x10, #336]\n msr s3_3_c4_c4_1, x9\n"
+         "  ldr x9, [x10, #104]\n msr cntkctl_el1, x9\n"
+@@ -797,12 +872,94 @@ uint64_t psci_by_hvc __attribute__((aligned(64)));
+ void other_cpu_entry(void);
+ void other_cpu_return_stub(void);
+ 
++/*
++ * "oem cores": each other core started on its own for a moment, before any kernel, to see what a fresh core is. It
++ * runs core_probe_entry with its MMU and caches off, writes its MPIDR_EL1, CurrentEL and SCTLR_EL1 into its slot
++ * (x0 = the slot) and switches itself off (PSCI CPU_OFF, the way psci_by_hvc says). Slot words: 0 MPIDR, 1 CurrentEL,
++ * 2 done, 3 SCTLR. Written for the S20 (runs 22-24: every core "taken" by the firmware, none ever joined the kernel).
++ */
++volatile uint64_t core_probe_slot[8][8] __attribute__((aligned(64)));
++uint64_t core_probe_shift __attribute__((aligned(64)));
++extern const char core_probe_low[], core_probe_low_end[];
++
++/*
++ * The same, but all of it in one page copied below the firmware's reserved areas (where Linux runs): its marks go
++ * in the page itself, 8 words from offset 0x100 by MPIDR Affinity1 (0x100 + core * 8 = MPIDR | 1), then CPU_OFF.
++ */
++__asm__ (
++        ".text\n"
++        ".balign 64\n"
++        ".globl core_probe_low\n"
++        "core_probe_low:\n"
++        "  msr daifset, #0xf\n"
++        "  mrs x1, mpidr_el1\n"
++        "  adr x2, core_probe_low\n"
++        "  add x2, x2, #0x100\n"
++        "  ubfx x3, x1, #8, #3\n"
++        "  add x2, x2, x3, lsl #3\n"
++        "  orr x1, x1, #1\n"
++        "  str x1, [x2]\n"
++        "  dsb sy\n"
++        "  adr x9, core_probe_low\n"
++        "  ldr x9, [x9, #0xf8]\n"              /* 1: HVC, 0: SMC (written by the loader) */
++        "  mov x0, #0x0002\n"
++        "  movk x0, #0x8400, lsl #16\n"
++        "  cbnz x9, 2f\n"
++        "  smc #0\n"
++        "1: wfi\n"
++        "  b 1b\n"
++        "2: hvc #0\n"
++        "  b 1b\n"
++        "core_probe_low_end:\n"
++        );
++void core_probe_entry(void);
++
++__asm__ (
++        ".text\n"
++        ".balign 64\n"
++        ".globl core_probe_entry\n"
++        "core_probe_entry:\n"
++        "  msr daifset, #0xf\n"
++        "  mov x5, x0\n"                       /* the context id as it arrived */
++        "  mrs x1, mpidr_el1\n"
++        "  adrp x10, core_probe_shift\n"
++        "  add  x10, x10, :lo12:core_probe_shift\n"
++        "  ldr x9, [x10]\n"
++        "  lsr x0, x1, x9\n"
++        "  and x0, x0, #7\n"
++        "  adrp x10, core_probe_slot\n"
++        "  add  x10, x10, :lo12:core_probe_slot\n"
++        "  add x0, x10, x0, lsl #6\n"          /* the slot of that core */
++        "  mrs x2, CurrentEL\n"
++        "  mrs x3, sctlr_el1\n"
++        "  str x5, [x0, #32]\n"
++        "  str x1, [x0]\n"
++        "  str x2, [x0, #8]\n"
++        "  str x3, [x0, #24]\n"
++        "  mov x4, #1\n"
++        "  str x4, [x0, #16]\n"
++        "  dsb sy\n"
++        "  adrp x10, psci_by_hvc\n"
++        "  add  x10, x10, :lo12:psci_by_hvc\n"
++        "  ldr x9, [x10]\n"
++        "  mov x0, #0x0002\n"                   /* PSCI CPU_OFF: does not return */
++        "  movk x0, #0x8400, lsl #16\n"
++        "  cbnz x9, 2f\n"
++        "  smc #0\n"
++        "1: wfi\n"
++        "  b 1b\n"
++        "2: hvc #0\n"
++        "  b 1b\n"
++        );
++
+ __asm__ (
+         ".text\n"
+         ".balign 64\n"
+         ".globl other_cpu_entry\n"
+-        "other_cpu_entry:\n"                    /* x0 = &other_cpu_start; MMU and caches are off */
++        "other_cpu_entry:\n"                    /* MMU and caches are off; x0 not trusted (the hypervisor's) */
+         "  msr daifset, #0xf\n"
++        "  adrp x0, other_cpu_start\n"
++        "  add  x0, x0, :lo12:other_cpu_start\n"
+         /* until the kernel has vectors of its own, an exception must not go nowhere */
+         "  adrp x9, other_cpu_vectors\n"
+         "  add  x9, x9, :lo12:other_cpu_vectors\n"
+@@ -899,6 +1056,9 @@ struct kernel_live {
+ 	uint64_t stop;                  /* ours to write: the host wants the run to end ("oem stop") */
+ 	uint64_t magic2;                /* "XNULIVE2": the kernel is new enough to have what follows */
+ 	uint64_t sound;                 /* (a virtual address too) the same for a recording of the sound */
++	uint64_t magic3;                /* "XNULIVE3": the remote mailbox follows */
++	uint64_t remote_seq;            /* ours to write: a new number for every "oem touch" */
++	char remote[240];               /* rwtouch's steps, ending with a zero (userland/src/rwremote.c) */
+ };
+ 
+ /*
+@@ -989,10 +1149,21 @@ static int run_active;
+ static uint64_t running_slide;
+ static void usb_poll_command(void);
+ 
++/* the generic timer's rate: the platform's where the firmware left CNTFRQ_EL0 unset (S-BOOT does) */
++static uint64_t
++timer_hz(void)
++{
++	if (PLAT != NULL && PLAT->timer_hz != 0) {
++		return PLAT->timer_hz;
++	}
++	uint64_t hz = READ_SYSREG(CNTFRQ_EL0);
++	return hz != 0 ? hz : 24000000;
++}
++
+ static uint64_t
+ seconds_since(uint64_t then)
+ {
+-	return (READ_SYSREG(CNTVCT_EL0) - then) / READ_SYSREG(CNTFRQ_EL0);
++	return (READ_SYSREG(CNTVCT_EL0) - then) / timer_hz();
+ }
+ 
+ /* Reverse a stretch of memory in place. */
+@@ -1259,7 +1430,7 @@ ufs_hash_partition(efi_block_io *bio, const char *name, uint64_t bytes)
+ 		}
+ 	}
+ 	print("ufs: %s: fnv %x over %d bytes, %d ms\n", name, h, bytes,
+-	    (READ_SYSREG(CNTVCT_EL0) - started) * 1000 / READ_SYSREG(CNTFRQ_EL0));
++	    (READ_SYSREG(CNTVCT_EL0) - started) * 1000 / timer_hz());
+ }
+ 
+ /* CRC-32 as GPT uses it (IEEE 802.3, reflected, 0xedb88320) */
+@@ -1535,6 +1706,14 @@ ufs_survey(void)
+  * the first phone's, and no write was ever served on another); they are printed instead.
+  */
+ #define BLOCK_WRITE_FIRST  2042368ULL                  /* darwin's blocks of 4096: past both cryptexes */
++/*
++ * The Galaxy S20's (x1s) data volume (devices/x1s/PLAN.md S5): the first USERDATA_VOL_BLOCKS blocks of its userdata,
++ * the owner's 110 GB for iOS, where Samsung's PIT puts userdata (block 2850304 of LUN 0, blocks of 4096). There a
++ * write may reach blocks 0 .. USERDATA_VOL_BLOCKS - 1 of the partition and nothing past them; the U-Boot under this
++ * loader (board/samsung/exynos-mobile/x1s-ufs.c) holds the same window and refuses any other write itself.
++ */
++#define USERDATA_PIT_START  2850304ULL
++#define USERDATA_VOL_BLOCKS 26855468ULL                 /* 110,000,000,000 bytes in blocks of 4096 */
+ #define BLOCK_DARWIN_MIN   5242875ULL                  /* blocks of 4096: the first phone's darwin, the layout's */
+ #define BLOCK_DARWIN_TYPE  { 0x7c3457ef, 0x0000, 0x11aa, { 0xaa, 0x11, 0x00, 0x30, 0x65, 0x43, 0xec, 0xac } }
+ 
+@@ -1621,7 +1800,9 @@ static int block_probe_requested;       /* ufs_probe=1: block_io2_probe() at blo
+ static efi_block_io *block_bios[BLOCK_MAX_PARTS];
+ static int block_enabled;
+ static int block_write_requested;       /* ufs_write=1 on the command line */
++static int str_same(const char *a, const char *b);
+ static int block_write_part = -1;       /* the only partition a write may reach; -1: none, writes refused */
++static uint64_t block_write_first = BLOCK_WRITE_FIRST, block_write_end = ~0ULL; /* its window, in its blocks */
+ static uint64_t block_writes, block_writes_refused, block_write_bytes;
+ 
+ /* the bytes of a device path before its end node */
+@@ -1724,7 +1905,7 @@ hc_wr(uint32_t off, uint32_t v)
+ static uint64_t
+ hc_ms_since(uint64_t then)
+ {
+-	return (READ_SYSREG(CNTVCT_EL0) - then) * 1000 / READ_SYSREG(CNTFRQ_EL0);
++	return (READ_SYSREG(CNTVCT_EL0) - then) * 1000 / timer_hz();
+ }
+ 
+ /* UEFI's list in, and running: what UEFI's driver needs to read or write */
+@@ -1868,6 +2049,43 @@ block_tables(void)
+ 	}
+ }
+ 
++/*
++ * The S20's userdata as the window for its data volume: the name, the first unit, blocks of 4096, where the PIT puts
++ * it and at least the volume's size. (Its type GUID is Samsung's generic one, which says nothing.)
++ */
++static int
++block_is_x1s_userdata(const efi_partition_info *info, const efi_block_io *bio, const struct loader_block_part *bp)
++{
++	static const char name[] = "userdata";
++	const char *why = NULL;
++
++	if (PLAT == NULL || !str_same(PLAT->name, "x1s")) {
++		return 0;
++	}
++	for (unsigned i = 0; i < sizeof(name); i++) {
++		if (bp->name[i] != name[i]) {
++			return 0;
++		}
++	}
++	if (bp->unit != 0) {
++		why = "it is not on the first logical unit";
++	} else if (bp->block_size != 4096 || bp->blocks < USERDATA_VOL_BLOCKS ||
++	    info->end_lba - info->start_lba + 1 != bp->blocks) {
++		why = "it is not at least 110 GB in blocks of 4096";
++	} else if (info->start_lba != USERDATA_PIT_START) {
++		why = "it does not start where Samsung's PIT puts it";
++	} else if (bio->media->read_only) {
++		why = "the firmware gives it out read only";
++	}
++	if (why != NULL) {
++		print("ufs: userdata: no write will be served: %s\n", why);
++		return 0;
++	}
++	print("ufs: userdata (LBA %d..%d of unit 0): its blocks 0..%d (110 GB) may be written this run\n",
++	    info->start_lba, info->end_lba, USERDATA_VOL_BLOCKS - 1);
++	return 1;
++}
++
+ /*
+  * Is this partition the one a write may reach? Everything about it has to be what it was when the
+  * port was set up; one field out of place and nothing is written this run. The name UEFI reports
+@@ -1982,6 +2200,12 @@ block_start(void)
+ 		}
+ 		if (block_write_requested && block_is_darwin(info, bio, bp)) {
+ 			block_write_part = (int)block_shared.parts;
++			block_write_first = BLOCK_WRITE_FIRST;
++			block_write_end = ~0ULL;
++		} else if (block_write_requested && block_is_x1s_userdata(info, bio, bp)) {
++			block_write_part = (int)block_shared.parts;
++			block_write_first = 0;
++			block_write_end = USERDATA_VOL_BLOCKS;
+ 		}
+ 		block_bios[block_shared.parts++] = bio;
+ 		if (block_probe_requested && bp->name[0] == 'd' && bp->name[1] == 'a' && bp->name[2] == 'r' &&
+@@ -2030,7 +2254,7 @@ block_start(void)
+ 	block_writes = block_writes_refused = block_write_bytes = 0;
+ 	if (block_write_part >= 0) {
+ 		block_shared.write_part_plus_one = (uint32_t)block_write_part + 1;
+-		block_shared.write_first = BLOCK_WRITE_FIRST;
++		block_shared.write_first = block_write_first;
+ 		block_shared.write_caps = BLOCK_CAN_FAST;
+ 	}
+ 	block_shared.magic = BLOCK_MAGIC;
+@@ -2066,7 +2290,7 @@ block_io2_probe(efi_handle h, efi_block_io *bio)
+ 	efi_status (EFIAPI *check_event)(void *) = (efi_status (EFIAPI *)(void *))BS->check_event;
+ 	static efi_block_io2_token tokens[8];
+ 	efi_block_io2 *bio2 = NULL;
+-	uint64_t bs = bio->media->block_size, t0, t_sync, t_issue = 0, t_all, freq = READ_SYSREG(CNTFRQ_EL0);
++	uint64_t bs = bio->media->block_size, t0, t_sync, t_issue = 0, t_all, freq = timer_hz();
+ 	uint64_t returned_done = 0, pending, polls = 0;
+ 	efi_status s;
+ 
+@@ -2158,7 +2382,8 @@ block_poll(void)
+ 			s = 0x800000000000000FULL;      /* EFI_ACCESS_DENIED */
+ 			bytes = 0;
+ 		} else if (op == BLOCK_OP_WRITE || op == BLOCK_OP_WRITE_FAST || op == BLOCK_OP_FLUSH) {
+-			if (block_write_part < 0 || part != (uint32_t)block_write_part || lba < BLOCK_WRITE_FIRST) {
++			if (block_write_part < 0 || part != (uint32_t)block_write_part || lba < block_write_first ||
++			    lba > block_write_end || count > block_write_end - lba) {
+ 				/* not darwin, or not past what the build writes from the computer: never */
+ 				if (block_writes_refused++ < 8) {
+ 					print("ufs: a write of %d blocks from %d of %s: REFUSED\n", count, lba,
+@@ -2282,12 +2507,148 @@ note_kernel_progress(const struct kernel_live *live, uint64_t slide, uint64_t se
+ 	print("\n");
+ }
+ 
++static int64_t psci_call(uint64_t function, uint64_t a1, uint64_t a2, uint64_t a3);
++
++/*
++ * "oem cores" (core_probe_entry above): every other core of the platform started for a moment with the platform's
++ * MPIDR for it (core << core_shift), and what it reports of itself. Then "oem log" and fetch it.
++ */
++static int64_t
++psci_call_by(int hvc, uint64_t function, uint64_t a1, uint64_t a2, uint64_t a3)
++{
++	register uint64_t x0 __asm__("x0") = function;
++	register uint64_t x1 __asm__("x1") = a1;
++	register uint64_t x2 __asm__("x2") = a2;
++	register uint64_t x3 __asm__("x3") = a3;
++
++	if (hvc) {
++		__asm__ volatile ("hvc #0" : "+r" (x0), "+r" (x1), "+r" (x2), "+r" (x3)
++                        : : "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17");
++	} else {
++		__asm__ volatile ("smc #0" : "+r" (x0), "+r" (x1), "+r" (x2), "+r" (x3)
++                        : : "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17");
++	}
++	return (int64_t)x0;
++}
++
++static void __attribute__((unused))
++core_probe_one(int core, int hvc, uint64_t entry, const char *how)
++{
++	uint64_t mpidr = (uint64_t)core << PLAT->core_shift, start;
++	volatile uint64_t *slot = core_probe_slot[core];
++	int64_t status, affinity;
++
++	psci_by_hvc = hvc;
++	clean_dcache((uint64_t)(uintptr_t)&psci_by_hvc, (uint64_t)(uintptr_t)&psci_by_hvc + 8);
++	for (int i = 0; i < 8; i++) {
++		slot[i] = 0;
++	}
++	flush_dcache((uint64_t)(uintptr_t)slot, (uint64_t)(uintptr_t)slot + 64);
++	status = psci_call_by(hvc, PSCI_CPU_ON, mpidr >> PLAT->psci_shift, entry, (uint64_t)(uintptr_t)slot);
++	start = READ_SYSREG(CNTVCT_EL0);
++	while (READ_SYSREG(CNTVCT_EL0) - start < timer_hz() / 5) {   /* 200 ms */
++		flush_dcache((uint64_t)(uintptr_t)slot, (uint64_t)(uintptr_t)slot + 64);
++		if (slot[2]) {
++			break;
++		}
++	}
++	BS->stall(50000);
++	affinity = psci_call_by(hvc, PSCI_AFFINITY_INFO, mpidr >> PLAT->psci_shift, 0, 0);
++	if (slot[2]) {
++		print("  core %d %s %s entry %x: CPU_ON %d; IT RAN: MPIDR_EL1 %x, CurrentEL %d, SCTLR_EL1 %x, x0 %x; "
++		    "AFFINITY_INFO %d\n", (uint64_t)core, hvc ? "HVC" : "SMC", how, entry, (uint64_t)status, slot[0],
++		    slot[1] >> 2, slot[3], slot[4], (uint64_t)affinity);
++	} else {
++		print("  core %d %s %s entry %x: CPU_ON %d; nothing in 200 ms; AFFINITY_INFO %d\n", (uint64_t)core,
++		    hvc ? "HVC" : "SMC", how, entry, (uint64_t)status, (uint64_t)affinity);
++	}
++}
++
++static void
++core_probe_low_run(void)
++{
++	uint64_t page = 0, n = (uint64_t)(core_probe_low_end - core_probe_low);
++	volatile uint64_t *marks;
++
++	/*
++	 * Probe 26c: the hypervisor may only start a core inside the image S-BOOT started (the boot image's kernel at
++	 * 0x80080000, which is U-Boot before it moved itself): a page there, the first one UEFI lets us have.
++	 */
++	for (uint64_t try = 0x80080000; try < 0x80200000 && page == 0; try += 0x1000) {
++		uint64_t at = try;
++
++		if (!EFI_ERROR(BS->allocate_pages(2 /* AllocateAddress */, 1 /* EfiLoaderCode */, 1, &at))) {
++			page = at;
++		}
++	}
++	if (n > 0xf0 || page == 0) {
++		print("  low probe: no page in 0x80080000-0x80200000 (%d bytes of code)\n", n);
++		return;
++	}
++	for (uint64_t i = 0; i < 0x1000; i++) {
++		((volatile char *)(uintptr_t)page)[i] = 0;
++	}
++	for (uint64_t i = 0; i < n; i++) {
++		((volatile char *)(uintptr_t)page)[i] = core_probe_low[i];
++	}
++	*(volatile uint64_t *)(uintptr_t)(page + 0xf8) = PLAT->psci_hvc;
++	flush_dcache(page, page + 0x1000);
++	__asm__ volatile ("dsb sy\n ic iallu\n dsb sy\n isb" ::: "memory");
++	marks = (volatile uint64_t *)(uintptr_t)(page + 0x100);
++	print("  low probe: %d bytes of code at %x\n", n, page);
++	for (int core = 1; core < PLAT->cores && core < 8; core++) {
++		uint64_t target = ((uint64_t)core << PLAT->core_shift) >> PLAT->psci_shift, start;
++		int64_t status, right_after, later;
++
++		status = psci_call_by(PLAT->psci_hvc, PSCI_CPU_ON, target, page, 0);
++		right_after = psci_call_by(PLAT->psci_hvc, PSCI_AFFINITY_INFO, target, 0, 0);
++		start = READ_SYSREG(CNTVCT_EL0);
++		while (READ_SYSREG(CNTVCT_EL0) - start < timer_hz()) {     /* 1 s */
++			flush_dcache(page + 0x100, page + 0x140);
++			if (marks[core] != 0) {
++				break;
++			}
++		}
++		BS->stall(50000);
++		later = psci_call_by(PLAT->psci_hvc, PSCI_AFFINITY_INFO, target, 0, 0);
++		flush_dcache(page + 0x100, page + 0x140);
++		print("  core %d (PSCI %x) low: CPU_ON %d, AFFINITY_INFO right after %d, later %d; marks %x %x %x %x %x %x\n",
++		    (uint64_t)core, target, (uint64_t)status, (uint64_t)right_after, (uint64_t)later, marks[0], marks[1],
++		    marks[2], marks[3], marks[4], marks[5]);
++	}
++}
++
++static void
++core_probe(void)
++{
++	uint64_t high = (uint64_t)(uintptr_t)&core_probe_entry;
++
++	print("core probe: platform PSCI by %s; this core: MPIDR_EL1 %x, CurrentEL %d\n", PLAT->psci_hvc ? "HVC" : "SMC",
++	    READ_SYSREG(MPIDR_EL1), READ_SYSREG(CurrentEL) >> 2);
++	core_probe_shift = PLAT->core_shift;
++	clean_dcache((uint64_t)(uintptr_t)&core_probe_shift, (uint64_t)(uintptr_t)&core_probe_shift + 8);
++	print("  PSCI_VERSION: HVC %x, SMC %x; FEATURES(CPU_ON): HVC %d, SMC %d\n",
++	    (uint64_t)psci_call_by(1, 0x84000000u, 0, 0, 0), (uint64_t)psci_call_by(0, 0x84000000u, 0, 0, 0),
++	    (uint64_t)psci_call_by(1, 0x8400000Au, PSCI_CPU_ON, 0, 0), (uint64_t)psci_call_by(0, 0x8400000Au, PSCI_CPU_ON, 0, 0));
++	clean_dcache(high, high + 0x100);
++	/* probe 25b: a jump pad below 4 GB and SMC changed nothing; each core once, the platform's way */
++	/* test 28: a core sent above 4 GB is lost until the next restart, so only the page below 4 GB */
++	(void)high;
++	core_probe_low_run();
++	psci_by_hvc = PLAT->psci_hvc;
++	clean_dcache((uint64_t)(uintptr_t)&psci_by_hvc, (uint64_t)(uintptr_t)&psci_by_hvc + 8);
++	print("core probe: done\n");
++}
++
+ /* A call of the firmware's power interface, the way this platform makes them. */
+ static int64_t
+ psci_call(uint64_t function, uint64_t a1, uint64_t a2, uint64_t a3)
+ {
+ 	int64_t status;
+ 
++	if (function == PSCI_CPU_ON || function == PSCI_AFFINITY_INFO) {
++		a1 >>= PLAT->psci_shift;        /* MPIDR -> the firmware's number for that core */
++	}
+ 	if (PLAT->psci_hvc) {
+ 		register uint64_t x0 __asm__("x0") = function;
+ 		register uint64_t x1 __asm__("x1") = a1;
+@@ -2337,8 +2698,41 @@ run_on_other_cpu(uint64_t mpidr, uint64_t entry, uint64_t boot_args_pa, const st
+ 	clean_dcache((uint64_t)(uintptr_t)&other_cpu_entry, (uint64_t)(uintptr_t)&other_cpu_entry + 0x1000);
+ 	clean_dcache((uint64_t)(uintptr_t)loader_ctx, (uint64_t)(uintptr_t)loader_ctx + sizeof(loader_ctx));
+ 
++	/*
++	 * Where the core is sent. The Galaxy S20's firmware keeps only the low 32 bits of CPU_ON's address, and a core
++	 * sent above 4 GB is lost until the next restart (test 28; "core 400 was started but never arrived", 14 Nov, with
++	 * this loader above 4 GB): there the core goes to a pad in a page below 4 GB, which jumps on to other_cpu_entry
++	 * by its whole address (ldr x9, the literal; br x9). Elsewhere straight to other_cpu_entry, as before.
++	 */
++	uint64_t to = (uint64_t)(uintptr_t)&other_cpu_entry;
++
++	if (to > 0xFFFFFFFFULL) {
++		static uint64_t pad;
++
++		if (pad == 0) {
++			uint64_t page = 0xFFFFF000;
++
++			if (!EFI_ERROR(BS->allocate_pages(1 /* AllocateMaxAddress */, 0 /* EfiReservedMemoryType */, 1, &page))) {
++				pad = page;
++			}
++		}
++		if (pad != 0) {
++			uint32_t *w = (uint32_t *)(uintptr_t)pad;
++
++			w[0] = 0x58000049u;             /* ldr x9, .+8 */
++			w[1] = 0xD61F0120u;             /* br x9 */
++			w[2] = (uint32_t)to;
++			w[3] = (uint32_t)(to >> 32);
++			clean_dcache(pad, pad + 64);
++			__asm__ volatile("ic iallu\n dsb sy\n isb" ::: "memory");
++			print("core %x starts through the pad at %x (below 4 GB)\n", mpidr, pad);
++			to = pad;
++		} else {
++			print("WARNING: no page below 4 GB for core %x to start at\n", mpidr);
++		}
++	}
+ 	/* the last argument arrives in that core's x0 */
+-	status = psci_call(PSCI_CPU_ON, mpidr, (uint64_t)(uintptr_t)&other_cpu_entry, (uint64_t)(uintptr_t)&other_cpu_start);
++	status = psci_call(PSCI_CPU_ON, mpidr, to, (uint64_t)(uintptr_t)&other_cpu_start);
+ 
+ 	started = last_pet = last_battery = last_beat_at = READ_SYSREG(CNTVCT_EL0);
+ 	print("core %x: the firmware answers %d to the request to start it\n", mpidr, (uint64_t)status);
+@@ -2371,8 +2765,10 @@ run_on_other_cpu(uint64_t mpidr, uint64_t entry, uint64_t boot_args_pa, const st
+ 			watching_only = 1;
+ 			daif = READ_SYSREG(DAIF);
+ 			__asm__ volatile ("msr daifset, #0xf");
+-			group1 = READ_SYSREG(S3_0_C12_C12_7);          /* ICC_IGRPEN1_EL1 */
+-			__asm__ volatile ("msr S3_0_C12_C12_7, %0\nisb" : : "r" ((uint64_t)0));
++			if (loader_has_icc) {
++				group1 = READ_SYSREG(S3_0_C12_C12_7);          /* ICC_IGRPEN1_EL1 */
++				__asm__ volatile ("msr S3_0_C12_C12_7, %0\nisb" : : "r" ((uint64_t)0));
++			}
+ 		}
+ 		/* both are written by a core with its caches off: look at memory, not at our copy */
+ 		flush_dcache((uint64_t)(uintptr_t)&other_cpu_done, (uint64_t)(uintptr_t)&other_cpu_done + 8);
+@@ -2404,6 +2800,12 @@ run_on_other_cpu(uint64_t mpidr, uint64_t entry, uint64_t boot_args_pa, const st
+ 			last_battery = READ_SYSREG(CNTVCT_EL0);
+ 		}
+ 		if (arrived && live != NULL) {
++			/*
++			 * The kernel's line, not a copy this core read before: on the Galaxy S20 (14 Nov, bootcpu=4) the
++			 * heartbeat looked still for 50 seconds while the kernel ran on and kept beating, and the run was
++			 * taken for hung -- after which the storage was no longer served.
++			 */
++			flush_dcache((uint64_t)(uintptr_t)&live->heartbeat, (uint64_t)(uintptr_t)&live->heartbeat + 8);
+ 			if (live->heartbeat != last_beat) {
+ 				last_beat = live->heartbeat;
+ 				last_beat_at = READ_SYSREG(CNTVCT_EL0);
+@@ -2436,7 +2838,9 @@ run_on_other_cpu(uint64_t mpidr, uint64_t entry, uint64_t boot_args_pa, const st
+ 	run_active = 0;
+ 
+ 	if (watching_only) {
+-		__asm__ volatile ("msr S3_0_C12_C12_7, %0\nisb" : : "r" (group1));
++		if (loader_has_icc) {
++			__asm__ volatile ("msr S3_0_C12_C12_7, %0\nisb" : : "r" (group1));
++		}
+ 		__asm__ volatile ("msr daif, %0" : : "r" (daif));
+ 	}
+ 	return status;
+@@ -2710,6 +3114,9 @@ static struct {
+ static uint64_t win_base, win_size; /* XNU's physical memory window, claimed once */
+ static uint64_t resident_rd_size;   /* root image kept at win_base + RESIDENT_RD_OFFSET, 0 if none */
+ static char last_result[64] = "idle";
++static char peek_result[32] = "none";
++static uint64_t kctx_va;                        /* "oem kva" */
++static uint64_t kctx_ttbr1;                     /* "oem kttbr1": a TTBR1 of the kernel's instead of our table */        /* the last "oem peek"/"oem poke" */
+ 
+ static void
+ set_result(const char *what, uint64_t a, uint64_t b)
+@@ -2815,6 +3222,117 @@ choose_window(const struct payload_info *pi)
+ 	return 1;
+ }
+ 
++/* two C strings the same */
++static int
++str_same(const char *a, const char *b)
++{
++	while (*a && *a == *b) {
++		a++;
++		b++;
++	}
++	return *a == *b;
++}
++
++/*
++ * The root image from a partition of the phone's own storage (rd_part=NAME on the payload's command line): read by
++ * this loader into the place "oem ramdisk" puts one, before the run, so the run is exactly a USB one without the USB
++ * (the S20's "Boot iOS from storage", devices/x1s/PLAN.md S4). Only read_blocks is called. The image is an APFS
++ * container: its size is its own superblock's (block size times block count at offsets 36 and 40, "NXSB" at 32), and
++ * it has to fit both the partition and the room. Returns the size read, or 0.
++ */
++static uint64_t
++rd_from_partition(const char *want, uint8_t *dest, uint64_t room)
++{
++	static const efi_guid part_guid = EFI_PARTITION_INFO_GUID;
++	static const efi_guid blk_guid = EFI_BLOCK_IO_GUID;
++	efi_handle *handles;
++	uint64_t count, size = 0;
++
++	if (EFI_ERROR(BS->locate_handle_buffer(ByProtocol, &part_guid, NULL, &count, &handles))) {
++		print("rd_part: no partitions from the firmware\n");
++		return 0;
++	}
++	for (uint64_t i = 0; i < count; i++) {
++		efi_partition_info *info;
++		efi_block_io *bio;
++		char name[40];
++		uint64_t bs, part_bytes, done, t0, nx_count = 0;
++		uint32_t nx_bs;
++
++		if (EFI_ERROR(BS->handle_protocol(handles[i], &part_guid, (void **)&info)) || info->type != 2 ||
++		    EFI_ERROR(BS->handle_protocol(handles[i], &blk_guid, (void **)&bio))) {
++			continue;
++		}
++		ufs_name(info, name, sizeof(name));
++		if (!str_same(name, want)) {
++			continue;
++		}
++		bs = bio->media->block_size;
++		part_bytes = (bio->media->last_block + 1) * bs;
++		if (bs == 0 || bs > 0x10000 || room < bs ||
++		    EFI_ERROR(bio->read_blocks(bio, bio->media->media_id, 0, bs, dest))) {
++			print("rd_part: %s: its first block does not read\n", name);
++			break;
++		}
++		nx_bs = (uint32_t)dest[36] | (uint32_t)dest[37] << 8 | (uint32_t)dest[38] << 16 | (uint32_t)dest[39] << 24;
++		for (int b = 7; b >= 0; b--) {
++			nx_count = nx_count << 8 | dest[40 + b];
++		}
++		if (memcmp(dest + 32, "NXSB", 4) != 0 || nx_bs == 0 || nx_count == 0 || nx_count > part_bytes / nx_bs) {
++			print("rd_part: %s holds no APFS image (or a damaged one)\n", name);
++			break;
++		}
++		size = (uint64_t)nx_bs * nx_count;
++		if (size > part_bytes || size > room || size % bs != 0) {
++			print("rd_part: the image (%x bytes) does not fit (partition %x, room %x)\n", size, part_bytes, room);
++			size = 0;
++			break;
++		}
++		print("rd_part: reading %d MB of %s into %x\n", size >> 20, name, (uint64_t)(uintptr_t)dest);
++		t0 = READ_SYSREG(CNTVCT_EL0);
++		for (done = 0; done < size;) {
++			uint64_t chunk = size - done < (16ULL << 20) ? size - done : (16ULL << 20);
++
++			if (EFI_ERROR(bio->read_blocks(bio, bio->media->media_id, done / bs, chunk, dest + done))) {
++				print("rd_part: read failed at %x\n", done);
++				size = 0;
++				break;
++			}
++			done += chunk;
++			if ((done & ((256ULL << 20) - 1)) == 0) {
++				print("rd_part: %d MB\n", done >> 20);
++			}
++		}
++		if (size) {
++			print("rd_part: %d MB in %d ms\n", size >> 20, hc_ms_since(t0));
++		}
++		break;
++	}
++	BS->free_pool(handles);
++	return size;
++}
++
++/* the value of NAME=value on a command line, into out (empty if it is not there) */
++static void
++cmdline_value(const char *cmdline, const char *key, char *out, unsigned size)
++{
++	unsigned k = 0, n = 0;
++
++	while (key[k]) {
++		k++;
++	}
++	out[0] = 0;
++	for (const char *c = cmdline; c && *c; c++) {
++		if ((c == cmdline || c[-1] == ' ') && memcmp(c, key, k) == 0) {
++			for (c += k; *c && *c != ' ' && n + 1 < size; c++) {
++				out[n++] = *c;
++			}
++			out[n] = 0;
++			return;
++		}
++	}
++}
++
+ /*
+  * Load and run the kernel from the payload. Returns when the kernel comes
+  * back (panic, checkpoint, early exception); the combined log is staged and
+@@ -2941,6 +3459,25 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
+ 		resident_rd_size = pi.resident_size;
+ 		print("resident image from the payload: %x bytes\n", (uint64_t)pi.resident_size);
+ 	}
++	/* or the root image from a partition of the phone's storage (rd_part=NAME): a boot with no host at all */
++	{
++		char rd_part[40];
++
++		cmdline_value(pi.cmdline, "rd_part=", rd_part, sizeof(rd_part));
++		if (rd_part[0] != 0 && pi.resident == NULL) {
++			uint64_t got = 0;
++
++			if (win_size > RESIDENT_RD_OFFSET + RESIDENT_RD_RESERVE) {
++				got = rd_from_partition(rd_part, (uint8_t *)(uintptr_t)(phys_base + RESIDENT_RD_OFFSET),
++				    win_size - RESIDENT_RD_OFFSET - RESIDENT_RD_RESERVE);
++			}
++			if (got == 0) {
++				print("rd_part=%s: no root image from the storage: not started\n", rd_part);
++				return 0;
++			}
++			resident_rd_size = got;
++		}
++	}
+ 	if (resident_rd_size != 0) {
+ 		uint64_t res_pa = phys_base + RESIDENT_RD_OFFSET;
+ 		uint64_t res_size = (resident_rd_size + PAGE_SIZE_MAX - 1) & ~(PAGE_SIZE_MAX - 1);
+@@ -2994,7 +3531,7 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
+ 	/* "bootcpu=N" among the kernel's arguments: run it on core N (see run_on_other_cpu) */
+ 	uint64_t this_mpidr = READ_SYSREG(MPIDR_EL1) & 0xFFFFFF, kernel_mpidr = this_mpidr;
+ 	/* "cpus=N" or "cpumask=M" there too: the kernel may have more cores than the one it starts on */
+-	int more_cores = 0, battery_requested = 0, ufs_requested = 0;
++	int more_cores = 0, battery_requested = 0, ufs_requested = 0, mongoose_requested = 0;
+ 	/* "torch=N" (not 0) there too: the phone's flashlight is the kernel's (drivers/camera/hakios.torch.c) */
+ 	int torch_requested = 0;
+ 	/* "cam=5" there too: the phone's wide camera is Darwin's (drivers/camera/hakios.camera.c) */
+@@ -3017,6 +3554,7 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
+ 			kernel_mpidr = (uint64_t)(c[8] - '0') << PLAT->core_shift;
+ 		}
+ 		more_cores |= (starts_with(c, "cpus=") || starts_with(c, "cpumask=")) && (c == pi.cmdline || c[-1] == ' ');
++		mongoose_requested |= starts_with(c, "mongoose=1") && (c == pi.cmdline || c[-1] == ' ');
+ 		battery_requested |= starts_with(c, "battery=1") && (c == pi.cmdline || c[-1] == ' ') &&
+ 		    (c[9] == 0 || c[9] == ' ');
+ 		torch_requested |= starts_with(c, "torch=") && (c == pi.cmdline || c[-1] == ' ') && c[6] >= '1' && c[6] <= '9';
+@@ -3208,7 +3746,7 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
+ 	/* --- device tree ---------------------------------------------------- */
+ 	const struct platform *plat = PLAT;
+ 	struct dt_writer w = { .base = (uint8_t *)dt_pa, .cur = (uint8_t *)dt_pa, .end = (uint8_t *)(dt_pa + dt_max), .depth = 0 };
+-	uint64_t cntfrq = READ_SYSREG(CNTFRQ_EL0);
++	uint64_t cntfrq = timer_hz();
+ 	uint64_t ranges[3] = { 0, plat->io_base, plat->io_size };
+ 	uint64_t reg2[2];
+ 	uint8_t seed[64];
+@@ -3244,6 +3782,23 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
+ 	dt_prop_u32(&w, "display-rotation", 0);
+ 	/* how the kernel is to ask the firmware for more cores (PSCI) */
+ 	dt_prop_str(&w, "psci-method", plat->psci_hvc ? "hvc" : "smc");
++	dt_prop_u32(&w, "psci-target-shift", (uint32_t)plat->psci_shift);
++	/*
++	 * A page below 4 GB for the cores to start at (the kernel writes a jump there): the S20's firmware keeps only the
++	 * low 32 bits of CPU_ON's address, and a core sent above 4 GB is lost until the next restart (test 28).
++	 */
++	if (more_cores) {
++		uint64_t page = 0xFFFFF000;
++
++		if (!EFI_ERROR(BS->allocate_pages(1 /* AllocateMaxAddress */, 0 /* EfiReservedMemoryType */, 1, &page))) {
++			memset((void *)(uintptr_t)page, 0, 0x1000);
++			flush_dcache(page, page + 0x1000);
++			dt_prop_u64(&w, "psci-entry-page", page);
++			print("cores start through the page at %x (below 4 GB)\n", page);
++		} else {
++			print("WARNING: no page below 4 GB for the cores to start at\n");
++		}
++	}
+ 	/* the time now, by the firmware's clock (the kernel has no real-time clock driver) */
+ 	uint64_t epoch = firmware_epoch();
+ 	if (epoch != 0) {
+@@ -3381,6 +3936,21 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
+ 				}
+ 			}
+ 		}
++		/* the cores numbered otherwise (mongoose=1): last, the kernel takes them only with cpus= as high */
++		for (int i = 0; mongoose_requested && i < 2 && cpu_count < 8; i++) {
++			uint64_t mpidr = plat->extra_mpidr[i];
++			int64_t state;
++
++			if (mpidr == 0 || mpidr == this_mpidr || mpidr == kernel_mpidr) {
++				continue;
++			}
++			state = psci_call(PSCI_AFFINITY_INFO, mpidr, 0, 0);
++			if (state == 1 || state == PSCI_NOT_SUPPORTED) {
++				cpu_mpidr[cpu_count++] = mpidr;
++			} else if (state >= 0) {
++				print("core %x is not off (the firmware says %d): not the kernel's to take\n", mpidr, (uint64_t)state);
++			}
++		}
+ 		print("cores for the kernel, in the order it takes them:");
+ 		for (int i = 0; i < cpu_count; i++) {
+ 			print(" %x", cpu_mpidr[i]);
+@@ -3427,9 +3997,16 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
+ 	}
+ 	dt_begin(&w, "gic");
+ 	dt_prop_str(&w, "device_type", "interrupt-controller");
+-	dt_prop_str(&w, "compatible", "arm,gic-v3");
+-	uint64_t gic_reg[4] = { plat->gic_dist - plat->io_base, 0x10000, plat->gic_redist - plat->io_base, 0x100000 };
+-	dt_prop(&w, "reg", gic_reg, sizeof(gic_reg));
++	if (plat->gic_cpu != 0) {
++		/* GIC-400 (v2): the distributor and the CPU interface */
++		dt_prop_str(&w, "compatible", "arm,gic-400");
++		uint64_t gic_reg[4] = { plat->gic_dist - plat->io_base, 0x1000, plat->gic_cpu - plat->io_base, 0x2000 };
++		dt_prop(&w, "reg", gic_reg, sizeof(gic_reg));
++	} else {
++		dt_prop_str(&w, "compatible", "arm,gic-v3");
++		uint64_t gic_reg[4] = { plat->gic_dist - plat->io_base, 0x10000, plat->gic_redist - plat->io_base, 0x100000 };
++		dt_prop(&w, "reg", gic_reg, sizeof(gic_reg));
++	}
+ 	dt_end(&w);
+ 	if (plat->uart != 0) {
+ 		dt_begin(&w, "uart0");
+@@ -3618,8 +4195,17 @@ static int download_to_ramdisk;     /* set by "oem ramdisk" for the one download
+ static uint8_t *usb_rx_buf, *usb_tx_buf;
+ static int usb_connected;
+ 
+-static const uint8_t usb_dev_desc[18] = { 18, 1, 0x10, 0x02, 0, 0, 0, 64, 0xd1, 0x18, 0x0d, 0xd0, 0x00, 0x01, 1, 2, 3, 1 };
+-static const uint8_t usb_ss_dev_desc[18] = { 18, 1, 0x00, 0x03, 0, 0, 0, 9, 0xd1, 0x18, 0x0d, 0xd0, 0x00, 0x01, 1, 2, 3, 1 };
++/*
++ * The product ID: 0xd00d by default. XNULOADER_USB_PID=0x4ee0 (U-Boot fastboot's, which Google's Android USB driver on
++ * Windows names) lets a Windows host use the driver it already has for the bootloader (devices/x1s: the S20).
++ */
++#ifndef XNULOADER_USB_PID
++#define XNULOADER_USB_PID 0xd00d
++#endif
++static const uint8_t usb_dev_desc[18] = { 18, 1, 0x10, 0x02, 0, 0, 0, 64, 0xd1, 0x18,
++	XNULOADER_USB_PID & 0xff, XNULOADER_USB_PID >> 8, 0x00, 0x01, 1, 2, 3, 1 };
++static const uint8_t usb_ss_dev_desc[18] = { 18, 1, 0x00, 0x03, 0, 0, 0, 9, 0xd1, 0x18,
++	XNULOADER_USB_PID & 0xff, XNULOADER_USB_PID >> 8, 0x00, 0x01, 1, 2, 3, 1 };
+ static const uint8_t usb_cfg_desc[32] = {
+ 	9, 2, 32, 0, 1, 1, 0, 0x80, 0x50,
+ 	9, 4, 0, 0, 2, 0xff, 0x42, 0x03, 4,   /* fastboot interface */
+@@ -3709,7 +4295,7 @@ usb_wait(uint8_t endpoint)
+ {
+ 	/* static: a long transfer is many short waits, and the watchdog must be fed across them */
+ 	static uint64_t last_pet;
+-	uint64_t freq = READ_SYSREG(CNTFRQ_EL0), began = READ_SYSREG(CNTVCT_EL0);
++	uint64_t freq = timer_hz(), began = READ_SYSREG(CNTVCT_EL0);
+ 
+ 	for (;;) {
+ 		uint32_t msg = UsbDeviceEventNoEvent;
+@@ -3811,8 +4397,32 @@ fb_command(char *cmd)
+ 	{
+ 		if (busy && (starts_with(cmd, "oem ramdisk") || starts_with(cmd, "download:") || starts_with(cmd, "oem run") ||
+ 		    starts_with(cmd, "oem selftest") || starts_with(cmd, "oem hang") || starts_with(cmd, "oem recording") ||
+-		    starts_with(cmd, "oem sound") || starts_with(cmd, "oem clearscreen") || starts_with(cmd, "oem memmap"))) {
++		    starts_with(cmd, "oem sound") || starts_with(cmd, "oem clearscreen") || starts_with(cmd, "oem memmap") ||
++		    starts_with(cmd, "oem cores"))) {
+ 			fb_reply("FAIL", "a kernel is running (oem stop ends it)");
++		} else if (starts_with(cmd, "oem touch ")) {
++			/*
++			 * "oem touch STEPS": rwtouch's steps (tap X Y, swipe X0 Y0 X1 Y1 MS, button home, ...) into the
++			 * running kernel's mailbox; rwremote in iOS runs them (devices/x1s/PLAN.md, the remote control)
++			 */
++			struct kernel_live *k = (struct kernel_live *)(uintptr_t)running_live;
++			const char *steps = cmd + 10;
++			unsigned n = 0;
++
++			if (!busy || k == NULL || k->magic2 != 0x324556494c554e58ULL || k->magic3 != 0x334556494c554e58ULL) {
++				fb_reply("FAIL", "no kernel with a remote mailbox is running");
++			} else {
++				while (steps[n] != 0 && n + 1 < sizeof(k->remote)) {
++					k->remote[n] = steps[n];
++					n++;
++				}
++				k->remote[n] = 0;
++				__asm__ volatile("dsb sy" ::: "memory");
++				k->remote_seq++;
++				clean_dcache((uint64_t)(uintptr_t)&k->remote_seq,
++				    (uint64_t)(uintptr_t)k->remote + sizeof(k->remote));
++				fb_reply("OKAY", "");
++			}
+ 		} else if (starts_with(cmd, "oem stop")) {
+ 			/* the kernel looks at this once a second and comes back as it does when its time is up */
+ 			if (busy && running_live != NULL) {
+@@ -3827,6 +4437,8 @@ fb_command(char *cmd)
+ 				fb_reply("OKAY", "0.5");
+ 			} else if (str_eq(var, "max-download-size")) {
+ 				fb_reply("OKAY", download_to_ramdisk ? "0xffffffff" : "0x03f00000");
++			} else if (str_eq(var, "peek")) {
++				fb_reply("OKAY", peek_result);
+ 			} else if (str_eq(var, "result")) {
+ 				fb_reply("OKAY", last_result);
+ 			} else if (str_eq(var, "screen") && SCREEN.base != 0) {
+@@ -3975,6 +4587,8 @@ fb_command(char *cmd)
+ 			set_result("running", cp, 0);
+ 			fb_reply("OKAY", "");
+ 			log_len = 0;
++			last_klog = NULL;       /* (the last run's log is about to be written over) */
++			last_klog_len = 0;
+ 			print("== XNULOADER run (usb) ==\n");
+ 			if (!run_kernel(have_cp, cp)) {
+ 				set_result("not-started", 0, 0);
+@@ -3988,11 +4602,430 @@ fb_command(char *cmd)
+ 			/* the firmware's memory map into the log (then "oem log" and fetch it) */
+ 			print_memory_map();
+ 			fb_reply("OKAY", "");
++		} else if (starts_with(cmd, "oem peek ") || starts_with(cmd, "oem poke ")) {
++			/*
++			 * One 32-bit register, by its physical address in hex without "0x" (U-Boot's map is identity):
++			 * "oem peek 18500000" reads it, "oem poke 18502400 5a5a5000" writes it and reads it back. For finding
++			 * at which stage a block stops taking writes (x1s GPU, 13 Nov: U-Boot's write sticks, the kernel's not).
++			 */
++			const char *a = cmd + 9, *v = a;
++			uint64_t addr = parse_number(a, 16);
++			uint32_t got;
++			char text[16];
++			static const char digits[] = "0123456789abcdef";
++
++			while (*v != 0 && *v != ' ') {
++				v++;
++			}
++			if (cmd[6] == 'k' && *v == ' ') {
++				*(volatile uint32_t *)addr = (uint32_t)parse_number(v + 1, 16);
++				__asm__ volatile ("dsb sy" : : : "memory");
++			}
++			got = *(volatile uint32_t *)addr;
++			for (int i = 0; i < 8; i++) {
++				text[i] = digits[(got >> (28 - 4 * i)) & 0xf];
++			}
++			text[8] = 0;
++			for (int i = 0; i <= 8; i++) {
++				peek_result[i] = text[i];       /* for "getvar:peek": fastboot does not show an oem's text */
++				if (!busy) {
++					last_result[i] = text[i];    /* (and "getvar:result" when no run is going on) */
++				}
++			}
++			fb_reply("OKAY", text);
++		} else if (starts_with(cmd, "oem ttbr1poke ")) {
++			/*
++			 * "oem ttbr1poke 18502400 5a5a5000": the same write as "oem poke", but with the upper translation table
++			 * switched on as a kernel's is (TTBR1_EL1 = this loader's own TTBR0 tables, TCR_EL1.EPD1 = 0, T1SZ = T0SZ,
++			 * TG1 4K), then everything put back. x1s, 13 Nov: the loader's writes reach the GPU, the kernel's never;
++			 * does the hypervisor change its mind once a kernel-style TTBR1 is set? Only low addresses are used here.
++			 */
++			const char *a = cmd + 14, *v = a;
++			uint64_t addr = parse_number(a, 16), tcr, ttbr0, ttbr1, ntcr;
++			uint32_t got;
++			static const char digits[] = "0123456789abcdef";
++
++			while (*v != 0 && *v != ' ') {
++				v++;
++			}
++			__asm__ volatile ("mrs %0, tcr_el1" : "=r" (tcr));
++			__asm__ volatile ("mrs %0, ttbr0_el1" : "=r" (ttbr0));
++			__asm__ volatile ("mrs %0, ttbr1_el1" : "=r" (ttbr1));
++			ntcr = (tcr & ~((0x3full << 16) | (1ull << 23) | (3ull << 30))) | ((tcr & 0x3f) << 16) | (2ull << 30) |
++			    (tcr & (0xfull << 8)) << 16 | (tcr & (3ull << 12)) << 16;
++			__asm__ volatile ("msr ttbr1_el1, %0; isb" : : "r" (ttbr0));
++			__asm__ volatile ("msr tcr_el1, %0; isb; tlbi vmalle1; dsb sy; isb" : : "r" (ntcr));
++			if (*v == ' ') {
++				*(volatile uint32_t *)addr = (uint32_t)parse_number(v + 1, 16);
++				__asm__ volatile ("dsb sy" : : : "memory");
++			}
++			got = *(volatile uint32_t *)addr;
++			__asm__ volatile ("msr tcr_el1, %0; isb" : : "r" (tcr));
++			__asm__ volatile ("msr ttbr1_el1, %0; isb; tlbi vmalle1; dsb sy; isb" : : "r" (ttbr1));
++			for (int i = 0; i < 8; i++) {
++				peek_result[i] = digits[(got >> (28 - 4 * i)) & 0xf];
++			}
++			peek_result[8] = 0;
++			if (!busy) {
++				for (int i = 0; i <= 8; i++) {
++					last_result[i] = peek_result[i];
++				}
++			}
++			fb_reply("OKAY", peek_result);
++		} else if (starts_with(cmd, "oem kttbr1 ")) {
++			/* "oem kttbr1 927915000": "oem kctxpoke" walks the kernel's own tables (left in memory by the last run) */
++			kctx_ttbr1 = parse_number(cmd + 11, 16);
++			fb_reply("OKAY", "");
++		} else if (starts_with(cmd, "oem kva ")) {
++			/* "oem kva fffffff24e002000": the page-aligned upper-half VA "oem kctxpoke" uses (0: 0xffffffc000000000) */
++			kctx_va = parse_number(cmd + 8, 16) & ~0xfffull;
++			fb_reply("OKAY", "");
++		} else if (starts_with(cmd, "oem kctxpoke ")) {
++			/*
++			 * "oem kctxpoke 18502400 5a5a5000": the write with the kernel's whole translation context at once (x1s,
++			 * run 51): TCR 0x22a51a251a, MAIR 0x0c08044f00bb44ff, SCTLR 0x3454593d, PSTATE.PAN set, and a TTBR1 table
++			 * mapping VA 0xffffffc000000000 onto the register's page with the kernel's device index 3. Registers only
++			 * in between (this loader's own memory has other attributes under that MAIR); all put back.
++			 * Bisect (13 Nov): the kernel's writes land with its MMU off (start.s), not from checkpoint 17 on.
++			 */
++			static uint64_t k_l1[512] __attribute__((aligned(4096)));
++			static uint64_t k_l2[512] __attribute__((aligned(4096)));
++			static uint64_t k_l3[512] __attribute__((aligned(4096)));
++			const char *a = cmd + 13, *v = a;
++			uint64_t addr = parse_number(a, 16), val = 0, w = 0, got = 0;
++			uint64_t o_tcr, o_mair, o_sctlr, o_ttbr1;
++			uint64_t va = kctx_va ? kctx_va : 0xffffffc000000000ull, hi = va | (addr & 0xfff);
++			static const char digits[] = "0123456789abcdef";
++
++			while (*v != 0 && *v != ' ') {
++				v++;
++			}
++			if (*v == ' ') {
++				w = 1;
++				val = parse_number(v + 1, 16);
++			}
++			memset(k_l1, 0, sizeof(k_l1));
++			memset(k_l2, 0, sizeof(k_l2));
++			memset(k_l3, 0, sizeof(k_l3));
++			k_l1[(va >> 30) & 0xff] = (uint64_t)(uintptr_t)k_l2 | 3;
++			k_l2[(va >> 21) & 0x1ff] = (uint64_t)(uintptr_t)k_l3 | 3;
++			k_l3[(va >> 12) & 0x1ff] = (addr & ~0xfffull) | 3ull << 2 | 1ull << 10 | 1ull << 54 | 1ull << 53 | 3;
++			flush_dcache((uint64_t)(uintptr_t)k_l1, (uint64_t)(uintptr_t)k_l1 + 3 * 4096);
++			__asm__ volatile ("mrs %0, tcr_el1" : "=r" (o_tcr));
++			__asm__ volatile ("mrs %0, mair_el1" : "=r" (o_mair));
++			__asm__ volatile ("mrs %0, sctlr_el1" : "=r" (o_sctlr));
++			__asm__ volatile ("mrs %0, ttbr1_el1" : "=r" (o_ttbr1));
++			__asm__ volatile (
++			    "  dsb sy\n"
++			    "  msr ttbr1_el1, %[t1]\n"
++			    "  msr tcr_el1, %[ktcr]\n"
++			    "  msr mair_el1, %[kmair]\n"
++			    "  isb\n"
++			    "  tlbi vmalle1\n"
++			    "  dsb sy\n"
++			    "  msr sctlr_el1, %[ksctlr]\n"
++			    "  isb\n"
++			    "  .inst 0xd500419f\n"             /* msr PAN, #1 */
++			    "  isb\n"
++			    "  cbz %[w], 1f\n"
++			    "  str %w[v], [%[h]]\n"
++			    "  dsb sy\n"
++			    "1:\n"
++			    "  ldr %w[g], [%[h]]\n"
++			    "  .inst 0xd500409f\n"             /* msr PAN, #0 */
++			    "  msr sctlr_el1, %[osctlr]\n"
++			    "  msr mair_el1, %[omair]\n"
++			    "  msr tcr_el1, %[otcr]\n"
++			    "  msr ttbr1_el1, %[ot1]\n"
++			    "  isb\n"
++			    "  tlbi vmalle1\n"
++			    "  dsb sy\n"
++			    "  isb\n"
++			    : [g] "=&r" (got)
++			    : [t1] "r" (kctx_ttbr1 ? kctx_ttbr1 : (uint64_t)(uintptr_t)k_l1), [ktcr] "r" (0x22a51a251aull), [kmair] "r" (0x0c08044f00bb44ffull),
++			      [ksctlr] "r" (0x3454593dull), [w] "r" (w), [v] "r" (val), [h] "r" (hi), [osctlr] "r" (o_sctlr),
++			      [omair] "r" (o_mair), [otcr] "r" (o_tcr), [ot1] "r" (o_ttbr1)
++			    : "memory");
++			for (int i = 0; i < 8; i++) {
++				peek_result[i] = digits[(got >> (28 - 4 * i)) & 0xf];
++			}
++			peek_result[8] = 0;
++			fb_reply("OKAY", peek_result);
++		} else if (starts_with(cmd, "oem offwrite ")) {
++			/*
++			 * "oem offwrite 40000040 f0": one 32-bit write by physical address with the MMU off, nothing read. XNU's
++			 * start.s (BCM2837) makes exactly this one on every core it starts, the Raspberry Pi's core-timer routing
++			 * (0x40000040 + 4 * core = 0xF0): on the S20 nobody knows what is there.
++			 */
++			const char *a = cmd + 13, *v = a;
++			uint64_t addr = parse_number(a, 16), val = 0, sctlr;
++
++			while (*v != 0 && *v != ' ') {
++				v++;
++			}
++			if (*v == ' ') {
++				val = parse_number(v + 1, 16);
++			}
++			__asm__ volatile ("mrs %0, sctlr_el1" : "=r" (sctlr));
++			__asm__ volatile (
++			    "  bic x9, %[s], #1\n"
++			    "  dsb sy\n"
++			    "  msr sctlr_el1, x9\n"
++			    "  isb\n"
++			    "  str %w[v], [%[a]]\n"
++			    "  isb sy\n"
++			    "  msr sctlr_el1, %[s]\n"
++			    "  isb\n"
++			    :
++			    : [s] "r" (sctlr), [a] "r" (addr), [v] "r" (val)
++			    : "x9", "memory");
++			fb_reply("OKAY", "");
++		} else if (starts_with(cmd, "oem ctxpoke ")) {
++			/*
++			 * "oem ctxpoke N 18502400 5a5a5000": the write made after CONTEXTIDR_EL1 = N and TTBR0_EL1's ASID field =
++			 * N (the same tables), as a running kernel has them; both put back. The hypervisor traps writes to these
++			 * (HCR_EL2.TVM) and may act on them.
++			 */
++			const char *a = cmd + 12, *b = a, *v;
++			uint64_t n = parse_number(a, 16), addr, oldctx, oldttbr0;
++			uint32_t got;
++			static const char digits[] = "0123456789abcdef";
++
++			while (*b != 0 && *b != ' ') {
++				b++;
++			}
++			if (*b == ' ') {
++				b++;
++			}
++			addr = parse_number(b, 16);
++			for (v = b; *v != 0 && *v != ' '; v++) {
++			}
++			__asm__ volatile ("mrs %0, contextidr_el1" : "=r" (oldctx));
++			__asm__ volatile ("mrs %0, ttbr0_el1" : "=r" (oldttbr0));
++			__asm__ volatile ("msr contextidr_el1, %0; isb" : : "r" (n));
++			__asm__ volatile ("msr ttbr0_el1, %0; isb; tlbi vmalle1; dsb sy; isb" : : "r" ((oldttbr0 & 0x0000ffffffffffffull) | (n & 0xff) << 48));
++			if (*v == ' ') {
++				*(volatile uint32_t *)addr = (uint32_t)parse_number(v + 1, 16);
++				__asm__ volatile ("dsb sy" : : : "memory");
++			}
++			got = *(volatile uint32_t *)addr;
++			__asm__ volatile ("msr ttbr0_el1, %0; isb; tlbi vmalle1; dsb sy; isb" : : "r" (oldttbr0));
++			__asm__ volatile ("msr contextidr_el1, %0; isb" : : "r" (oldctx));
++			for (int i = 0; i < 8; i++) {
++				peek_result[i] = digits[(got >> (28 - 4 * i)) & 0xf];
++			}
++			peek_result[8] = 0;
++			fb_reply("OKAY", peek_result);
++		} else if (starts_with(cmd, "oem timepoke ")) {
++			/*
++			 * "oem timepoke 18502404": 1000 writes of 0 and 1000 reads of that register, timed with the generic
++			 * timer; "getvar:peek" then says "w<ticks> r<ticks>" (ticks of CNTFRQ, 26 MHz on x1s). A write the
++			 * hypervisor traps and carries out costs microseconds; one the bus takes, nanoseconds.
++			 */
++			uint64_t addr = parse_number(cmd + 13, 16), t0, t1, t2;
++			char *o = peek_result;
++			static const char digits[] = "0123456789abcdef";
++
++			t0 = READ_SYSREG(CNTVCT_EL0);
++			for (int i = 0; i < 1000; i++) {
++				*(volatile uint32_t *)addr = 0;
++				__asm__ volatile ("dsb sy" : : : "memory");
++			}
++			t1 = READ_SYSREG(CNTVCT_EL0);
++			for (int i = 0; i < 1000; i++) {
++				(void)*(volatile uint32_t *)addr;
++			}
++			t2 = READ_SYSREG(CNTVCT_EL0);
++			*o++ = 'w';
++			for (int i = 0; i < 6; i++) {
++				*o++ = digits[((t1 - t0) >> (20 - 4 * i)) & 0xf];
++			}
++			*o++ = 'r';
++			for (int i = 0; i < 6; i++) {
++				*o++ = digits[((t2 - t1) >> (20 - 4 * i)) & 0xf];
++			}
++			*o = 0;
++			fb_reply("OKAY", peek_result);
++		} else if (starts_with(cmd, "oem offpoke ")) {
++			/*
++			 * "oem offpoke 18502400 5a5a5000": the MMU switched off (as on the way into a kernel), the register
++			 * written and read back by its physical address, the MMU on again; then the write is tried once more
++			 * with the MMU on ("oem peek" after shows it). Registers only between the switches: no memory touched.
++			 */
++			const char *a = cmd + 12, *v = a;
++			uint64_t addr = parse_number(a, 16), val = 0, got = 0, sctlr;
++			static const char digits[] = "0123456789abcdef";
++
++			while (*v != 0 && *v != ' ') {
++				v++;
++			}
++			if (*v == ' ') {
++				val = parse_number(v + 1, 16);
++			}
++			__asm__ volatile ("mrs %0, sctlr_el1" : "=r" (sctlr));
++			__asm__ volatile (
++			    "  bic x9, %[s], #1\n"
++			    "  dsb sy\n"
++			    "  msr sctlr_el1, x9\n"
++			    "  isb\n"
++			    "  str %w[v], [%[a]]\n"
++			    "  dsb sy\n"
++			    "  ldr %w[g], [%[a]]\n"
++			    "  msr sctlr_el1, %[s]\n"
++			    "  isb\n"
++			    : [g] "=&r" (got)
++			    : [s] "r" (sctlr), [a] "r" (addr), [v] "r" (val)
++			    : "x9", "memory");
++			for (int i = 0; i < 8; i++) {
++				peek_result[i] = digits[(got >> (28 - 4 * i)) & 0xf];
++			}
++			peek_result[8] = 0;
++			fb_reply("OKAY", peek_result);
++		} else if (starts_with(cmd, "oem sctlrpoke ")) {
++			/*
++			 * "oem sctlrpoke 3454593d 18502400 5a5a5000": the write made with SCTLR_EL1 set to the given value (x1s:
++			 * the kernel's, 0x3454593d), then SCTLR put back. Only this loader's own mappings are used meanwhile.
++			 */
++			const char *a = cmd + 14, *b = a, *v;
++			uint64_t want = parse_number(a, 16), old, addr;
++			uint32_t got;
++			static const char digits[] = "0123456789abcdef";
++
++			while (*b != 0 && *b != ' ') {
++				b++;
++			}
++			if (*b == ' ') {
++				b++;
++			}
++			addr = parse_number(b, 16);
++			for (v = b; *v != 0 && *v != ' '; v++) {
++			}
++			__asm__ volatile ("mrs %0, sctlr_el1" : "=r" (old));
++			__asm__ volatile ("msr sctlr_el1, %0; isb" : : "r" (want));
++			if (*v == ' ') {
++				*(volatile uint32_t *)addr = (uint32_t)parse_number(v + 1, 16);
++				__asm__ volatile ("dsb sy" : : : "memory");
++			}
++			got = *(volatile uint32_t *)addr;
++			__asm__ volatile ("msr sctlr_el1, %0; isb" : : "r" (old));
++			for (int i = 0; i < 8; i++) {
++				peek_result[i] = digits[(got >> (28 - 4 * i)) & 0xf];
++			}
++			peek_result[8] = 0;
++			fb_reply("OKAY", peek_result);
++		} else if (starts_with(cmd, "oem hipoke ") || starts_with(cmd, "oem hikpoke ")) {
++			/*
++			 * "oem hipoke 18502400 5a5a5000": the write made through a HIGH virtual address, as a kernel makes it: a
++			 * TTBR1 table of this loader's own (39-bit upper range, 4K pages) maps VA 0xffffff8000000000 onto the
++			 * register's 4K page as Device-nGnRnE (this loader's MAIR index 0); written, read back, all put back.
++			 */
++			static uint64_t hi_l1[512] __attribute__((aligned(4096)));
++			static uint64_t hi_l2[512] __attribute__((aligned(4096)));
++			static uint64_t hi_l3[512] __attribute__((aligned(4096)));
++			/* "oem hikpoke": the same with the kernel's MAIR (x1s: 0x0c08044f00bb44ff) and its device index, 3 */
++			int kmair = cmd[6] == 'k';
++			const char *a = cmd + (kmair ? 12 : 11), *v = a;
++			uint64_t addr = parse_number(a, 16), tcr, ttbr1, ntcr, mair, val = 0, kgot = 0;
++			volatile uint32_t *hi = (volatile uint32_t *)(0xffffff8000000000ull | (addr & 0xfff));
++			uint32_t got;
++			int dev = -1;
++			static const char digits[] = "0123456789abcdef";
++
++			while (*v != 0 && *v != ' ') {
++				v++;
++			}
++			__asm__ volatile ("mrs %0, mair_el1" : "=r" (mair));
++			for (int i = 0; i < 8; i++) {
++				if (((mair >> (8 * i)) & 0xff) == 0 && dev < 0) {
++					dev = i;
++				}
++			}
++			memset(hi_l1, 0, sizeof(hi_l1));
++			memset(hi_l2, 0, sizeof(hi_l2));
++			memset(hi_l3, 0, sizeof(hi_l3));
++			hi_l1[0] = (uint64_t)(uintptr_t)hi_l2 | 3;
++			hi_l2[0] = (uint64_t)(uintptr_t)hi_l3 | 3;
++			if (kmair) {
++				dev = 3;
++			}
++			hi_l3[0] = (addr & ~0xfffull) | (uint64_t)(dev < 0 ? 0 : dev) << 2 | 1ull << 10 | 1ull << 54 | 1ull << 53 | 3;
++			flush_dcache((uint64_t)(uintptr_t)hi_l1, (uint64_t)(uintptr_t)hi_l1 + 3 * 4096);
++			__asm__ volatile ("mrs %0, tcr_el1" : "=r" (tcr));
++			__asm__ volatile ("mrs %0, ttbr1_el1" : "=r" (ttbr1));
++			ntcr = (tcr & ~((0x3full << 16) | (1ull << 23) | (3ull << 30) | (0xffull << 24))) | (25ull << 16) | (2ull << 30) |
++			    (tcr & (0xfull << 8)) << 16 | (tcr & (3ull << 12)) << 16;
++			__asm__ volatile ("msr ttbr1_el1, %0; isb" : : "r" ((uint64_t)(uintptr_t)hi_l1));
++			__asm__ volatile ("msr tcr_el1, %0; isb; tlbi vmalle1; dsb sy; isb" : : "r" (ntcr));
++			if (kmair) {
++				/* registers only while the kernel's MAIR is in: this loader's own memory has other attributes then */
++				val = *v == ' ' ? parse_number(v + 1, 16) : 0;
++				__asm__ volatile (
++				    "  dsb sy\n"
++				    "  msr mair_el1, %[k]\n"
++				    "  isb\n"
++				    "  tlbi vmalle1\n"
++				    "  dsb sy\n"
++				    "  isb\n"
++				    "  cbz %[w], 1f\n"
++				    "  str %w[v], [%[h]]\n"
++				    "  dsb sy\n"
++				    "1:\n"
++				    "  ldr %w[g], [%[h]]\n"
++				    "  msr mair_el1, %[m]\n"
++				    "  isb\n"
++				    "  tlbi vmalle1\n"
++				    "  dsb sy\n"
++				    "  isb\n"
++				    : [g] "=&r" (kgot)
++				    : [k] "r" (0x0c08044f00bb44ffull), [m] "r" (mair), [h] "r" (hi), [v] "r" (val),
++				      [w] "r" ((uint64_t)(*v == ' '))
++				    : "memory");
++				got = (uint32_t)kgot;
++			} else {
++				if (*v == ' ') {
++					*hi = (uint32_t)parse_number(v + 1, 16);
++					__asm__ volatile ("dsb sy" : : : "memory");
++				}
++				got = *hi;
++			}
++			__asm__ volatile ("msr tcr_el1, %0; isb" : : "r" (tcr));
++			__asm__ volatile ("msr ttbr1_el1, %0; isb; tlbi vmalle1; dsb sy; isb" : : "r" (ttbr1));
++			for (int i = 0; i < 8; i++) {
++				peek_result[i] = digits[(got >> (28 - 4 * i)) & 0xf];
++			}
++			peek_result[8] = 0;
++			if (!busy) {
++				for (int i = 0; i <= 8; i++) {
++					last_result[i] = peek_result[i];
++				}
++			}
++			fb_reply("OKAY", peek_result);
++		} else if (starts_with(cmd, "oem sysreg ")) {
++			/* this core's SCTLR (0), TCR (1), MAIR (2), CurrentEL (3), ACTLR (4) as 16 hex digits in "getvar:result" */
++			uint64_t r = 0;
++			static const char digits[] = "0123456789abcdef";
++
++			switch (cmd[11]) {
++			case '0': __asm__ volatile ("mrs %0, sctlr_el1" : "=r" (r)); break;
++			case '1': __asm__ volatile ("mrs %0, tcr_el1" : "=r" (r)); break;
++			case '2': __asm__ volatile ("mrs %0, mair_el1" : "=r" (r)); break;
++			case '3': __asm__ volatile ("mrs %0, CurrentEL" : "=r" (r)); break;
++			case '4': __asm__ volatile ("mrs %0, actlr_el1" : "=r" (r)); break;
++			}
++			for (int i = 0; i < 16; i++) {
++				last_result[i] = digits[(r >> (60 - 4 * i)) & 0xf];
++			}
++			last_result[16] = 0;
++			fb_reply("OKAY", last_result);
++		} else if (starts_with(cmd, "oem cores")) {
++			/* every other core started for a moment, and what it says of itself (then "oem log") */
++			core_probe();
++			fb_reply("OKAY", "");
+ 		} else if (starts_with(cmd, "oem log")) {
+ 			if (busy && running_live != NULL) {
+ 				compose_live_log(running_live, running_slide);
+ 			} else {
+-				compose_logs(NULL, 0);
++				compose_logs(last_klog, last_klog_len);   /* (the last run's kernel log with it, if there was one) */
+ 			}
+ 			fb_reply("OKAY", "");
+ 		} else if (starts_with(cmd, "reboot") || starts_with(cmd, "oem reboot")) {
+@@ -4319,6 +5352,27 @@ efi_main(efi_handle image, efi_system_table *st)
+ 	IMAGE = image;
+ 
+ 	BS->set_watchdog_timer(0, 0, 0, NULL);
++	/*
++	 * Which phone this is, by the framebuffer its firmware hands over: before anything looks for the payload, whose
++	 * place is the platform's. Nothing is printed yet (the banner comes first).
++	 */
++	PLAT = &platform_qemu_virt;
++	if (EFI_ERROR(BS->locate_protocol(&gop_guid, NULL, (void **)&GOP)) || GOP->mode == NULL ||
++	    GOP->mode->info == NULL || GOP->mode->fb_base == 0) {
++		GOP = NULL;                     /* no display (QEMU without -device ramfb) */
++	} else {
++		for (uint32_t i = 0; i < sizeof(known_platforms) / sizeof(known_platforms[0]); i++) {
++			if (GOP->mode->fb_base == known_platforms[i]->fb_base) {
++				PLAT = known_platforms[i];
++			}
++		}
++	}
++	klog_on_console = (PLAT == &platform_qemu_virt);
++	if (PLAT->payload_base != 0) {
++		payload_base = PLAT->payload_base;
++	}
++	/* a GICv2 phone: no ICC_* registers to save or restore around a kernel run */
++	loader_has_icc = PLAT->gic_cpu == 0;
+ 	/* no payload in memory (nobody put one there): the volume this loader came from may have one, as a UEFI boot loader's does */
+ 	if (((const struct payload_header *)PAYLOAD_BASE)->magic != PAYLOAD_MAGIC) {
+ 		load_payload_from_volume();
+@@ -4334,23 +5388,17 @@ efi_main(efi_handle image, efi_system_table *st)
+ 	print("CurrentEL=%x MIDR=%x MMFR0=%x CNTFRQ=%d image=%x\n", READ_SYSREG(CurrentEL) >> 2, READ_SYSREG(MIDR_EL1),
+ 	    READ_SYSREG(ID_AA64MMFR0_EL1), READ_SYSREG(CNTFRQ_EL0), (uint64_t)(uintptr_t)&__ImageBase);
+ 
+-	PLAT = &platform_qemu_virt;
+-	if (EFI_ERROR(BS->locate_protocol(&gop_guid, NULL, (void **)&GOP)) || GOP->mode == NULL ||
+-	    GOP->mode->info == NULL || GOP->mode->fb_base == 0) {
+-		GOP = NULL;                     /* no display (QEMU without -device ramfb) */
+-	} else {
++	if (GOP != NULL) {
+ 		SCREEN.base = GOP->mode->fb_base;
+ 		SCREEN.width = GOP->mode->info->width;
+ 		SCREEN.height = GOP->mode->info->height;
+ 		SCREEN.stride = GOP->mode->info->pixels_per_scanline * 4;
+-		if (SCREEN.base == 0xE1000000ULL) {
+-			PLAT = &platform_redwood;
+-		} else {
+-			ramfb_phone_screen();
++		if (PLAT == &platform_qemu_virt) {
++			ramfb_phone_screen();   /* QEMU's fw_cfg: only where no phone was recognised */
+ 		}
+ 		print("display %d x %d at %x\n", (uint64_t)SCREEN.width, (uint64_t)SCREEN.height, SCREEN.base);
+ 	}
+-	print("platform %s\n", PLAT->name);
++	print("platform %s, payload at %x, timer %d Hz\n", PLAT->name, PAYLOAD_BASE, timer_hz());
+ 
+ 	install_exception_hook();
+ 	wdt_arm();
+@@ -4364,6 +5412,15 @@ efi_main(efi_handle image, efi_system_table *st)
+ 	/* One-shot mode: run the kernel that came with the image, then reset. */
+ 	if (have_payload) {
+ 		run_kernel(0, 0);
++	} else if (PLAT == &platform_x1s) {
++		/*
++		 * The S20 while its kernel is being ported: the loader alone, to see that it starts and knows the phone.
++		 * Its lines stay on the screen a while, then U-Boot's menu again (no reset: U-Boot is started again by
++		 * nothing on this phone but S-BOOT).
++		 */
++		print("no payload: back to U-Boot's menu in 20 s\n");
++		BS->stall(20000000);
++		return 0;
+ 	}
+ 	reboot();
+ 	return 0;

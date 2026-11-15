@@ -1,0 +1,726 @@
+diff --git a/drivers/input/conf b/drivers/input/conf
+index 63d10a4..29b8e44 100644
+--- a/drivers/input/conf
++++ b/drivers/input/conf
+@@ -14,6 +14,11 @@ driver GOODIX
+ 	help    the touch screen: a Goodix GT9916 ("Berlin-D") or a FocalTech FT3680 on SPI (touchscreen=1). The bus,
+ 	help    pins and supplies are the POCO X5 Pro's; another phone with one of these controllers changes those
+ 
++driver SEC_TS
++	file    bsd/dev/hakios.sec_ts.c
++	help    the Galaxy S20's (x1s) touch screen: Samsung's sec_ts (Y79A) on the Exynos990's I2C, its supplies on the
++	help    display power chip (sec_ts=1). The bus, pins and supplies are this phone's
++
+ driver BUTTONS
+ 	file    bsd/dev/hakios.buttons.c
+ 	help    the power and volume keys, read from the PMIC through the SPMI arbiter (buttons=1)
+diff --git a/drivers/input/hakios.input.c b/drivers/input/hakios.input.c
+index 8452a55..9fd149d 100644
+--- a/drivers/input/hakios.input.c
++++ b/drivers/input/hakios.input.c
+@@ -159,11 +159,25 @@ touch_feel_add(uint32_t type, uint32_t finger, uint64_t now)
+ 	}
+ }
+ 
++/*
++ * Called at every touch, the screen's and rwtouch's alike, when a driver has set it: the GPU's governor (hakios.mali.c,
++ * mali_gov=1) takes it to its top clock before the first frame of a swipe is drawn, not a tick of its own later.
++ */
++void (*hakios_touch_boost)(void);
++void (*hakios_touch_boost_cpu)(void);           /* the same for the CPU clocks (hakios.exynos_thermal.c, cpu_gov=1) */
++
+ static void
+ touch_post(uint32_t type, uint32_t finger, uint32_t x, uint32_t y, bool from_driver)
+ {
+ 	struct hakios_touch *t;
+ 
++	if (hakios_touch_boost != NULL) {
++		hakios_touch_boost();
++	}
++	if (hakios_touch_boost_cpu != NULL) {
++		hakios_touch_boost_cpu();
++	}
++
+ 	lck_mtx_lock(&touch_lock);
+ 	if (touch_tail - touch_head == TOUCH_QUEUE) {
+ 		touch_head++;                   /* nobody reads: drop the oldest */
+@@ -284,11 +298,13 @@ hakios_input_init(void)
+ 	hakios_cpufreq_init();
+ 	hakios_virtio_input_init();
+ 	hakios_goodix_init();
++	hakios_sec_ts_init();
+ 	hakios_buttons_init();
+ 	hakios_battery_init();
+ 	hakios_ufs_init();
+ 	hakios_net_init();
+ 	hakios_adreno_init();
++	hakios_mali_init();
+ 	hakios_wifi_init();
+ 	hakios_adsp_init();
+ 	hakios_mpss_init();
+diff --git a/drivers/input/hakios.sec_ts.c b/drivers/input/hakios.sec_ts.c
+new file mode 100644
+index 0000000..d2383bf
+--- /dev/null
++++ b/drivers/input/hakios.sec_ts.c
+@@ -0,0 +1,552 @@
++/*
++ * The Samsung Galaxy S20's (x1s, Exynos990) touch screen: Samsung's own touch controller ("sec_ts", the Y79A) on the
++ * SoC's I2C bus hsi2c15, as a source of touches for /dev/hakios-touch (sys/hakios.input.h). Only with boot-arg
++ * sec_ts=1: every address below belongs to this phone.
++ *
++ * There is no clock, pin, regulator or I2C framework in this kernel, so the driver does it all, the way HakiOS's U-Boot
++ * does it on this phone (devices/x1s/u-boot: touchtest, test 21: 102 touches in 20 s, 12 Nov 2026):
++ *   power    the chip's two supplies are LDO2 (tsp_io, 1.8 V) and LDO3 (tsp_avdd, 3.0 V) of the S2DOS05, the display's
++ *            power chip, which S-BOOT does not switch on. S-BOOT reaches that chip by driving GPP1-0 (SCL) and GPP1-1
++ *            (SDA) by hand, its I2C controller left in reset; so does this: EN (0x03) |= 0x06, read twice first and only
++ *            if LDO2_CFG (0x05) and LDO3_CFG (0x06) already read 0x0C (the device tree's voltages)
++ *   clocks   on: S-BOOT leaves CMU_TOP's PERIC1 gates and CMU_PERIC1's USI_I2C on (U-Boot touchcheck, test 17)
++ *   pins     GPP5-6/7 (0x10730000) to I2C (function 3) with no pull; the interrupt line GPA1-0 (0x15850020) an input with
++ *            no pull, looked at, not taken as an interrupt (low: an event waits)
++ *   I2C      hsi2c15 at 0x108D0000 (USI07's I2C; its USI mode register already reads I2C): out of reset (USI_CON 0xC4 =
++ *            0), master, auto mode, 100 kHz for a 200 MHz input; polled messages with a stop after each, errors from
++ *            INT_STATUS bits 8-11 (bit 10: no device), as Samsung's i2c-exynos5.c takes them
++ *   chip     0x55 status (0x20: running its firmware), 0x22 ID, 0x23 its coordinate range, 0x62 clear its events,
++ *            0x10 sensing on; then 0x60 one event (16 bytes), 0x61 the rest (byte 7 bits 0-4 say how many). An event:
++ *            byte 0 bits 0-1 kind (0: a finger), 2-5 the finger (from 1), 6-7 press 1 / move 2 / release 3;
++ *            x = b1 << 4 | b3 >> 4, y = b2 << 4 | b3 & 15
++ *
++ * Register layouts: Samsung's kernel for this phone (github.com/ExtremeXT/android_kernel_samsung_exynos990):
++ * drivers/input/touchscreen/sec_ts/y79a, drivers/i2c/busses/i2c-exynos5.c, drivers/regulator/s2dos05.c, and the
++ * phone's device tree as S-BOOT hands it over.
++ *
++ * Boot-args:
++ *   sec_ts=1                 the touch screen on
++ *   sec_ts_poll_us=<us>      how often the interrupt line is looked at (1000 to 50000; 8000)
++ *   sec_ts_flip=<n>          1: mirror left-right, 2: top-bottom, 3: both
++ */
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <libkern/libkern.h>
++#include <mach/mach_types.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include <sys/errno.h>
++#include <sys/hakios.input.h>
++#include <sys/systm.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++
++#define GPIO_PERIC0_PA          0x10430000u     /* GPP1: the display power chip's bus */
++#define GPP1_CON                0x20u
++#define GPP1_DAT                0x24u
++#define GPP1_PUD                0x28u
++#define GPIO_PERIC1_PA          0x10730000u     /* GPP5: the touch bus */
++#define GPP5_CON                0x00u
++#define GPP5_DAT                0x04u
++#define GPP5_PUD                0x08u
++#define GPIO_ALIVE_PA           0x15850000u     /* GPA1: the touch interrupt line */
++#define GPA1_DAT                0x24u
++#define GPA1_PUD                0x28u
++#define HSI2C15_PA              0x108D0000u
++
++#define TS_ADDR                 0x48
++#define DOS_ADDR                0x60
++#define BB_SCL                  0
++#define BB_SDA                  1
++#define BB_US                   10
++
++#define HSI2C_CTL               0x00u
++#define HSI2C_FIFO_CTL          0x04u
++#define HSI2C_TRAILIG_CTL       0x08u
++#define HSI2C_INT_ENABLE        0x20u
++#define HSI2C_INT_STATUS        0x24u
++#define HSI2C_FIFO_STATUS       0x30u
++#define HSI2C_TX_DATA           0x34u
++#define HSI2C_RX_DATA           0x38u
++#define HSI2C_CONF              0x40u
++#define HSI2C_AUTO_CONF         0x44u
++#define HSI2C_TIMEOUT           0x48u
++#define HSI2C_TIMING_FS1        0x60u
++#define HSI2C_TIMING_FS2        0x64u
++#define HSI2C_TIMING_FS3        0x68u
++#define HSI2C_ADDR              0x70u
++#define HSI2C_USI_CON           0xc4u
++
++#define TS_READ_BOOT_STATUS     0x55
++#define TS_READ_DEVICE_ID       0x22
++#define TS_READ_PANEL_INFO      0x23
++#define TS_CLEAR_EVENTS         0x62
++#define TS_SENSE_ON             0x10
++#define TS_READ_ONE_EVENT       0x60
++#define TS_READ_ALL_EVENT       0x61
++#define TS_STATUS_APP_MODE      0x20
++#define TS_EVENT_SIZE           16
++#define TS_MAX_EVENTS           8
++#define TS_MAX_FINGERS          10
++
++static vm_offset_t peric0, peric1, alive, i2c;
++static uint32_t max_x = 4095, max_y = 4095, flip;
++static struct {
++	uint32_t events, touches, bad, last_x, last_y;
++} seen;
++static struct {
++	bool down;
++	uint32_t x, y;
++} contact[TS_MAX_FINGERS];
++
++static inline uint32_t
++rd(vm_offset_t address)
++{
++	return *(volatile uint32_t *)address;
++}
++
++static inline void
++wr(vm_offset_t address, uint32_t value)
++{
++	*(volatile uint32_t *)address = value;
++}
++
++static inline void
++set_bits(vm_offset_t address, uint32_t mask, uint32_t value)
++{
++	wr(address, (rd(address) & ~mask) | value);
++}
++
++static void
++sleep_us(uint32_t us)
++{
++	delay_for_interval(us, NSEC_PER_USEC);
++}
++
++static void
++sleep_ms(uint32_t ms)
++{
++	delay_for_interval(ms, NSEC_PER_MSEC);
++}
++
++static uint64_t
++ms_now(void)
++{
++	uint64_t ns;
++
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	return ns / NSEC_PER_MSEC;
++}
++
++/* ---- the display power chip, by hand on GPP1-0/1 (open drain: low = output 0, high = input) ------------------ */
++
++static uint32_t bb_saved[3];
++
++static void
++bb_set(int pin, bool high)
++{
++	if (high) {
++		set_bits(peric0 + GPP1_CON, 0xfu << (4 * pin), 0);
++	} else {
++		set_bits(peric0 + GPP1_DAT, 1u << pin, 0);
++		set_bits(peric0 + GPP1_CON, 0xfu << (4 * pin), 1u << (4 * pin));
++	}
++	sleep_us(BB_US);
++}
++
++static int
++bb_get(int pin)
++{
++	return (rd(peric0 + GPP1_DAT) >> pin) & 1;
++}
++
++static void
++bb_scl_high(void)
++{
++	bb_set(BB_SCL, true);
++	for (int i = 0; i < 200 && !bb_get(BB_SCL); i++) {     /* a device stretching the clock */
++		sleep_us(10);
++	}
++}
++
++static void
++bb_begin(void)
++{
++	bb_saved[0] = rd(peric0 + GPP1_CON);
++	bb_saved[1] = rd(peric0 + GPP1_DAT);
++	bb_saved[2] = rd(peric0 + GPP1_PUD);
++	set_bits(peric0 + GPP1_PUD, 0xff, 0x33);               /* pull-ups on SCL, SDA while this runs */
++	bb_set(BB_SDA, true);
++	bb_scl_high();
++}
++
++static void
++bb_end(void)
++{
++	wr(peric0 + GPP1_DAT, bb_saved[1]);
++	wr(peric0 + GPP1_CON, bb_saved[0]);
++	wr(peric0 + GPP1_PUD, bb_saved[2]);
++}
++
++static void
++bb_start(void)
++{
++	bb_set(BB_SDA, true);
++	bb_scl_high();
++	bb_set(BB_SDA, false);
++	bb_set(BB_SCL, false);
++}
++
++static void
++bb_stop(void)
++{
++	bb_set(BB_SDA, false);
++	bb_scl_high();
++	bb_set(BB_SDA, true);
++}
++
++/* a byte out; true if the device acknowledged it */
++static bool
++bb_out(uint8_t v)
++{
++	int nack;
++
++	for (int i = 7; i >= 0; i--) {
++		bb_set(BB_SDA, (v >> i) & 1);
++		bb_scl_high();
++		bb_set(BB_SCL, false);
++	}
++	bb_set(BB_SDA, true);
++	bb_scl_high();
++	nack = bb_get(BB_SDA);
++	bb_set(BB_SCL, false);
++	return nack == 0;
++}
++
++static uint8_t
++bb_in(void)
++{
++	uint8_t v = 0;
++
++	bb_set(BB_SDA, true);
++	for (int i = 0; i < 8; i++) {
++		bb_scl_high();
++		v = (uint8_t)((v << 1) | bb_get(BB_SDA));
++		bb_set(BB_SCL, false);
++	}
++	bb_set(BB_SDA, true);                                   /* no acknowledge: one byte only */
++	bb_scl_high();
++	bb_set(BB_SCL, false);
++	return v;
++}
++
++static bool
++dos_read(uint8_t reg, uint8_t *val)
++{
++	bool ok = false;
++
++	bb_start();
++	if (bb_out(DOS_ADDR << 1) && bb_out(reg)) {
++		bb_start();
++		if (bb_out((DOS_ADDR << 1) | 1)) {
++			*val = bb_in();
++			ok = true;
++		}
++	}
++	bb_stop();
++	return ok;
++}
++
++static bool
++dos_write(uint8_t reg, uint8_t val)
++{
++	bool ok;
++
++	bb_start();
++	ok = bb_out(DOS_ADDR << 1) && bb_out(reg) && bb_out(val);
++	bb_stop();
++	return ok;
++}
++
++/* the touch chip's supplies on; false if the power chip does not answer or its voltages are not the expected ones */
++static bool
++supplies_on(void)
++{
++	uint8_t en = 0, again = 0, l2 = 0, l3 = 0;
++	bool ok = false;
++
++	bb_begin();
++	if (!dos_read(0x03, &en) || !dos_read(0x05, &l2) || !dos_read(0x06, &l3) || !dos_read(0x03, &again) || en != again) {
++		printf("sec_ts: the display power chip does not answer (or not the same twice): no touch screen\n");
++	} else if ((l2 & 0x7f) != 0x0c || (l3 & 0x7f) != 0x0c) {
++		printf("sec_ts: the touch supplies are not set to 1.8 V and 3.0 V (%02x, %02x): not switched on\n", l2, l3);
++	} else if ((en & 0x06) == 0x06) {
++		printf("sec_ts: the touch supplies are already on (EN %02x)\n", en);
++		ok = true;
++	} else {
++		ok = dos_write(0x03, (uint8_t)(en | 0x06)) && dos_read(0x03, &again) && (again & 0x06) == 0x06;
++		printf("sec_ts: touch supplies on: EN %02x -> %02x%s\n", en, again, ok ? "" : " (FAILED)");
++	}
++	bb_end();
++	return ok;
++}
++
++/* ---- the touch bus, hsi2c15 ---------------------------------------------------------------------------------- */
++
++static void
++i2c_reset(void)
++{
++	set_bits(i2c + HSI2C_CTL, 1u << 31, 1u << 31);          /* SW_RST */
++	set_bits(i2c + HSI2C_CTL, 1u << 31, 0);
++	wr(i2c + HSI2C_CTL, 1u << 3);                           /* master */
++	wr(i2c + HSI2C_TRAILIG_CTL, 0xffffff);
++	set_bits(i2c + HSI2C_CONF, 1u << 31, 1u << 31);         /* auto mode */
++}
++
++/* i2c-exynos5.c's fast-mode timing, for op_clk at an input of ipclk */
++static void
++i2c_timing(uint32_t ipclk, uint32_t op_clk)
++{
++	uint32_t div = (ipclk / (op_clk * 15)) & 0xff;
++	uint32_t h = ((9 * ipclk) / (1000 * 1000)) / ((div + 1) * 10);
++	uint32_t start = (9 * ipclk / (1000 * 1000)) / ((div + 1) * 10) - 1;
++
++	h = ((0xffffffffu >> h) << h) & 0xff;
++	start = ((0xffffffffu >> start) << start) & 0xff;
++	set_bits(i2c + HSI2C_TIMING_FS3, 0xffu << 16, div << 16);
++	set_bits(i2c + HSI2C_TIMING_FS2, 0xff, h);
++	set_bits(i2c + HSI2C_TIMING_FS1, 0xffu << 16, start << 16);
++}
++
++/* one message to the touch chip, polled, a stop after it; 0 or an error */
++static int
++i2c_msg(bool read, uint8_t *buf, uint32_t len)
++{
++	uint32_t ctl = rd(i2c + HSI2C_CTL), conf, addr, n = 0, level = len < 0x40 ? len : 0x40;
++	uint64_t until = ms_now() + 100;
++
++	set_bits(i2c + HSI2C_TIMEOUT, 1u << 31, 0);
++	wr(i2c + HSI2C_FIFO_CTL, 3u | (level << 4) | (level << 16));
++	ctl &= ~((1u << 6) | (1u << 7));
++	ctl |= (read ? 1u << 6 : 1u << 7) | (1u << 3);         /* RXCHON or TXCHON; master (CTL reads 0 on this one) */
++	conf = rd(i2c + HSI2C_AUTO_CONF);
++	conf = read ? conf | (1u << 16) : conf & ~(1u << 16);
++	conf |= 1u << 17;                                       /* stop after it */
++	addr = rd(i2c + HSI2C_ADDR) & ~((0x3ffu << 10) | 0x3ffu | (0xffu << 24));
++	wr(i2c + HSI2C_ADDR, addr | (0x7u << 24) | ((uint32_t)TS_ADDR << 10));
++	wr(i2c + HSI2C_CTL, ctl);
++	wr(i2c + HSI2C_INT_ENABLE, (1u << 7) | (0xfu << 8));    /* transfer done; the transfer-state errors */
++	wr(i2c + HSI2C_INT_STATUS, rd(i2c + HSI2C_INT_STATUS));
++	conf = (conf & ~0xffffu) | len;
++	wr(i2c + HSI2C_AUTO_CONF, conf);
++	wr(i2c + HSI2C_AUTO_CONF, conf | (1u << 31));           /* master run */
++	while (ms_now() < until) {
++		uint32_t fifo = rd(i2c + HSI2C_FIFO_STATUS), ints = rd(i2c + HSI2C_INT_STATUS);
++
++		if (ints & (0xfu << 8)) {                       /* bit 10: no device; the others, other errors */
++			wr(i2c + HSI2C_INT_STATUS, ints);
++			i2c_reset();
++			return (ints & (1u << 10)) ? ENODEV : EIO;
++		}
++		if (read) {
++			if (!(fifo & (1u << 24))) {
++				buf[n++] = (uint8_t)rd(i2c + HSI2C_RX_DATA);
++			}
++			if (n >= len) {
++				return 0;
++			}
++		} else {
++			if (n < len && (fifo & 0x7f) < 0x40) {
++				wr(i2c + HSI2C_TX_DATA, buf[n++]);
++			}
++			if (n >= len && (ints & (1u << 7)) && (fifo & (1u << 8))) {
++				wr(i2c + HSI2C_INT_STATUS, ints);
++				return 0;
++			}
++		}
++	}
++	i2c_reset();
++	return ETIMEDOUT;
++}
++
++static int
++ts_read(uint8_t cmd, uint8_t *buf, uint32_t len)
++{
++	int error = i2c_msg(false, &cmd, 1);
++
++	return error ? error : i2c_msg(true, buf, len);
++}
++
++static int
++ts_command(uint8_t cmd)
++{
++	return i2c_msg(false, &cmd, 1);
++}
++
++/* ---- touches ------------------------------------------------------------------------------------------------- */
++
++static void
++ts_event(const uint8_t *e)
++{
++	static unsigned shown;
++	uint32_t finger = (e[0] >> 2) & 0xf, action = (e[0] >> 6) & 3;
++	uint32_t x = ((uint32_t)e[1] << 4) | (e[3] >> 4), y = ((uint32_t)e[2] << 4) | (e[3] & 0xf);
++
++	seen.events++;
++	if ((e[0] & 3) != 0) {                                  /* a status event, not a finger */
++		return;
++	}
++	if (finger == 0 || finger > TS_MAX_FINGERS) {
++		seen.bad++;
++		return;
++	}
++	finger--;
++	if (shown < 40) {
++		shown++;
++		printf("sec_ts: finger %u %s at %u, %u (of %u x %u)\n", finger, action == 1 ? "down" : action == 3 ? "up" : "move",
++		    x, y, max_x, max_y);
++	}
++	seen.touches++;
++	seen.last_x = x;
++	seen.last_y = y;
++	x = x >= max_x ? 65535 : x * 65535 / max_x;
++	y = y >= max_y ? 65535 : y * 65535 / max_y;
++	if (flip & 1) {
++		x = 65535 - x;
++	}
++	if (flip & 2) {
++		y = 65535 - y;
++	}
++	if (action == 3) {
++		if (contact[finger].down) {
++			contact[finger].down = false;
++			hakios_touch_post(HAKIOS_TOUCH_UP, finger, x, y);
++		}
++		return;
++	}
++	if (!contact[finger].down) {
++		hakios_touch_post(HAKIOS_TOUCH_DOWN, finger, x, y);
++	} else if (contact[finger].x != x || contact[finger].y != y) {
++		hakios_touch_post(HAKIOS_TOUCH_MOVE, finger, x, y);
++	}
++	contact[finger].down = true;
++	contact[finger].x = x;
++	contact[finger].y = y;
++}
++
++static void
++ts_poll(void)
++{
++	static uint8_t ev[TS_EVENT_SIZE * TS_MAX_EVENTS];
++	uint32_t left;
++
++	if (ts_read(TS_READ_ONE_EVENT, ev, TS_EVENT_SIZE) || ev[0] == 0) {
++		return;
++	}
++	left = ev[7] & 0x1f;
++	if (left > TS_MAX_EVENTS - 1) {
++		left = TS_MAX_EVENTS - 1;
++	}
++	if (left && ts_read(TS_READ_ALL_EVENT, ev + TS_EVENT_SIZE, TS_EVENT_SIZE * left)) {
++		left = 0;
++	}
++	for (uint32_t i = 0; i <= left; i++) {
++		ts_event(ev + TS_EVENT_SIZE * i);
++	}
++}
++
++static bool
++ts_probe(void)
++{
++	uint8_t status = 0, id[5] = { 0 }, info[11] = { 0 };
++	int error = ENODEV;
++
++	set_bits(peric1 + GPP5_CON, 0xffu << 24, 0x33u << 24);  /* GPP5-6/7: I2C */
++	set_bits(peric1 + GPP5_PUD, 0xffu << 24, 0);
++	set_bits(alive + GPA1_PUD, 0xf, 0);                     /* GPA1-0: no pull-down, the chip drives it */
++	wr(i2c + HSI2C_USI_CON, 0);                             /* out of reset */
++	i2c_reset();
++	i2c_timing(200000000, 100000);
++	for (int i = 0; i < 10 && error; i++) {
++		error = ts_read(TS_READ_BOOT_STATUS, &status, 1);
++		if (error) {
++			sleep_ms(100);
++		}
++	}
++	if (error) {
++		printf("sec_ts: the touch chip does not answer (%d): no touch screen\n", error);
++		return false;
++	}
++	ts_read(TS_READ_DEVICE_ID, id, sizeof(id));
++	if (ts_read(TS_READ_PANEL_INFO, info, sizeof(info)) == 0) {
++		uint32_t x = ((uint32_t)info[0] << 8) | info[1], y = ((uint32_t)info[2] << 8) | info[3];
++
++		if (x > 1 && y > 1) {
++			max_x = x - 1;
++			max_y = y - 1;
++		}
++	}
++	printf("sec_ts: status %02x%s, ID %02x %02x %02x %02x %02x, coordinates %u x %u\n", status,
++	    status == TS_STATUS_APP_MODE ? " (running its firmware)" : " (NOT its application)", id[0], id[1], id[2], id[3],
++	    id[4], max_x + 1, max_y + 1);
++	if (ts_command(TS_CLEAR_EVENTS) || ts_command(TS_SENSE_ON)) {
++		printf("sec_ts: sensing could not be switched on: no touch screen\n");
++		return false;
++	}
++	return true;
++}
++
++static void
++sec_ts_thread(__unused void *arg, __unused wait_result_t wr_unused)
++{
++	uint32_t poll_us = 8000, idle = 0;
++
++	PE_parse_boot_argn("sec_ts_poll_us", &poll_us, sizeof(poll_us));
++	if (poll_us < 1000 || poll_us > 50000) {
++		poll_us = 8000;
++	}
++	if (!supplies_on()) {
++		return;
++	}
++	sleep_ms(500);                                          /* the chip's own start */
++	if (!ts_probe()) {
++		return;
++	}
++	printf("sec_ts: touch screen ready; the interrupt line is looked at every %u us\n", poll_us);
++	for (unsigned tick = 1;; tick++) {
++		/* low: an event waits. And every 16 ms anyway, in case a short pulse was missed. */
++		if (!(rd(alive + GPA1_DAT) & 1) || ++idle >= 16000 / poll_us) {
++			idle = 0;
++			ts_poll();
++		}
++		if (tick % (60 * (1000000 / poll_us)) == 0) {
++			printf("sec_ts: so far %u events, %u finger positions (%u bad), the last at %u, %u\n", seen.events,
++			    seen.touches, seen.bad, seen.last_x, seen.last_y);
++		}
++		sleep_us(poll_us);
++	}
++}
++
++/* started from hakios_input_init() (drivers/input/hakios.input.c), after /dev/hakios-touch is there */
++void
++hakios_sec_ts_init(void)
++{
++	uint32_t enabled = 0;
++	thread_t thread;
++
++	if (!PE_parse_boot_argn("sec_ts", &enabled, sizeof(enabled)) || !enabled) {
++		return;
++	}
++	PE_parse_boot_argn("sec_ts_flip", &flip, sizeof(flip));
++	peric0 = ml_io_map(GPIO_PERIC0_PA, 0x1000);
++	peric1 = ml_io_map(GPIO_PERIC1_PA, 0x1000);
++	alive = ml_io_map(GPIO_ALIVE_PA, 0x1000);
++	i2c = ml_io_map(HSI2C15_PA, 0x1000);
++	if (peric0 == 0 || peric1 == 0 || alive == 0 || i2c == 0) {
++		printf("sec_ts: could not map the pins or the I2C controller; off\n");
++		return;
++	}
++	if (kernel_thread_start(sec_ts_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
+diff --git a/userland/rc.jobs.remote b/userland/rc.jobs.remote
+new file mode 100644
+index 0000000..0f5df54
+--- /dev/null
++++ b/userland/rc.jobs.remote
+@@ -0,0 +1,5 @@
++# Commands run by the launchd job com.hakios.demo (see com.hakios.demo.plist) for a session driven from the computer:
++# the load monitor, and rwremote, which runs the touches the computer sends (fastboot oem touch STEPS; the kernel on
++# another core, bootcpu=N, so that the loader listens while it runs)
++/redwood/bin/cputop 10 &
++/redwood/bin/rwremote &
+diff --git a/userland/src/rwremote.c b/userland/src/rwremote.c
+new file mode 100644
+index 0000000..7928afa
+--- /dev/null
++++ b/userland/src/rwremote.c
+@@ -0,0 +1,66 @@
++/*
++ * rwremote: touches from the computer while iOS runs (the Galaxy S20's remote control, devices/x1s/PLAN.md).
++ *
++ * The host sends "fastboot oem touch STEPS" to the loader, which watches the kernel from core 0 (bootcpu=N); the loader
++ * puts STEPS into the kernel's loader_live mailbox with a new number (xnu/files/osfmk/arm64/loader_return.c), and the
++ * kernel gives both out as kern.hakios.remote, "NUMBER STEPS". This program looks every 30 ms and runs
++ *   /redwood/bin/rwtouch STEPS
++ * for each new number -- tap, swipe, drag, button home and the rest of rwtouch's steps. One command at a time:
++ * a new one waits for the one before to end.
++ *
++ * usage: rwremote          (rc.jobs.remote starts it in the background)
++ */
++#include <spawn.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/sysctl.h>
++#include <sys/wait.h>
++#include <unistd.h>
++
++extern char **environ;
++
++int
++main(void)
++{
++	unsigned long long last = 0;
++	int said = 0;
++
++	for (;;) {
++		char buf[320], *steps, *argv[64];
++		size_t len = sizeof(buf) - 1;
++		unsigned long long seq;
++		int argc = 0;
++		pid_t pid;
++
++		if (sysctlbyname("kern.hakios.remote", buf, &len, NULL, 0) != 0) {
++			if (!said) {
++				printf("rwremote: no kern.hakios.remote in this kernel: nothing to do\n");
++				said = 1;
++			}
++			sleep(5);
++			continue;
++		}
++		buf[len < sizeof(buf) ? len : sizeof(buf) - 1] = 0;
++		seq = strtoull(buf, &steps, 10);
++		if (seq == 0 || seq == last) {
++			usleep(30000);
++			continue;
++		}
++		last = seq;
++		argv[argc++] = "/redwood/bin/rwtouch";
++		for (char *t = strtok(steps, " \t\n"); t != NULL && argc < 63; t = strtok(NULL, " \t\n")) {
++			argv[argc++] = t;
++		}
++		argv[argc] = NULL;
++		if (argc < 2) {
++			continue;
++		}
++		printf("rwremote: %llu:%s\n", seq, steps);
++		if (posix_spawn(&pid, argv[0], NULL, NULL, argv, environ) == 0) {
++			int status;
++
++			waitpid(pid, &status, 0);
++		}
++	}
++}
+diff --git a/xnu/files/bsd/sys/hakios.input.h b/xnu/files/bsd/sys/hakios.input.h
+index bfb7d63..88bbe5e 100644
+--- a/xnu/files/bsd/sys/hakios.input.h
++++ b/xnu/files/bsd/sys/hakios.input.h
+@@ -41,6 +41,7 @@ void hakios_touch_post(uint32_t type, uint32_t finger, uint32_t x, uint32_t y);
+ void hakios_input_init(void);
+ void hakios_virtio_input_init(void);   /* boot-arg virtio_input=1: QEMU's virtio pointer and keyboard */
+ void hakios_goodix_init(void);         /* boot-arg touchscreen=1: the phone's Goodix or FocalTech touch screen */
++void hakios_sec_ts_init(void);         /* boot-arg sec_ts=1: the Galaxy S20's (x1s) touch screen */
+ void hakios_buttons_init(void);        /* boot-arg buttons=1: the phone's power and volume keys */
+ void hakios_ufs_init(void);           /* ufs=2 to xnuloader: the phone's storage, read only, through the loader (ufs_shared_pa=) */
+ void hakios_ufs_report(const char *when); /* where reading the storage has spent its time so far */
+@@ -79,6 +80,12 @@ void hakios_adreno_init(void);         /* boot-arg adreno=N: the first N steps o
+ void hakios_adreno_quiesce(void);      /* on the way back to the loader: the GPU block stopped, out of our memory */
+ void hakios_adreno_stop(void);         /* before that, where the ending is no panic's: the GPU given back in order */
+ void hakios_adreno_minute(void);       /* once a minute: a line about how warm the GPU is, if it is in use */
++void hakios_mali_init(void);           /* boot-arg mali=N: the first N steps of waking the Galaxy S20's (Exynos990) Mali GPU */
++void hakios_mali_stop(void);           /* its cores off, if they were left on */
++int hakios_exynos_temperature(uint32_t zone); /* an Exynos990 APM temperature zone in degrees (3: the GPU), -1 if not known */
++int hakios_exynos_acpm(uint32_t channel, uint32_t cmd[4]); /* a message to the Exynos990's APM, its answer in cmd: 0 or an errno */
++void hakios_exynos_acpm_show(uint32_t channel);  /* an APM channel's description and queues, in the log (read only) */
++void hakios_exynos_acpm_list(void);              /* every APM channel of the firmware's table, in the log (read only) */
+ void hakios_wifi_init(void);           /* boot-arg wifi=1: the phone's Wi-Fi; wifi_step=N: the first N steps of it */
+ void hakios_adsp_init(void);           /* boot-arg adsp=1: the phone's audio DSP started and linked; adsp_step=N: the first N steps */
+ void hakios_mpss_init(void);           /* boot-arg modem=1: the phone's modem started and linked; modem_step=N: the first N steps */
