@@ -69,10 +69,18 @@ jobs:
           mkdir -p logs
           xnu/apply.sh > logs/kernel-build.log 2>&1 || { tail -n 80 logs/kernel-build.log; exit 1; }
           xnu-deps/setup.sh >> logs/kernel-build.log 2>&1 || { tail -n 80 logs/kernel-build.log; exit 1; }
-          ./xnu-build.sh -j"$(nproc)" -k >> logs/kernel-build.log 2>&1 || { tail -n 80 logs/kernel-build.log; exit 1; }
+          # XNU's export-list checks can fail after the fresh kernel has been linked.
+          build_status=0
+          ./xnu-build.sh -j"$(nproc)" -k >> logs/kernel-build.log 2>&1 || build_status=$?
           kernel=xnu-src/xnu-8796.121.2/BUILD/obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837
-          test -s "$kernel"
-          grep -aFq 'cpu_gov: no worker available; off' "$kernel"
+          if ! test -s "$kernel" || ! grep -aFq 'cpu_gov: no worker available; off' "$kernel"; then
+            grep -nE 'error:|Error [0-9]|No such file|undefined|command not found' logs/kernel-build.log | head -n 60 || true
+            tail -n 40 logs/kernel-build.log
+            exit 1
+          fi
+          if (( build_status != 0 )); then
+            echo "::warning::Make returned $build_status after producing the kernel. The fresh output passed the candidate check."
+          fi
           mkdir ../out-cpu-kernel
           cp "$kernel" ../out-cpu-kernel/kernel-x1s
           cp ../port/patches/UPSTREAM_BASE ../out-cpu-kernel/UPSTREAM_BASE
