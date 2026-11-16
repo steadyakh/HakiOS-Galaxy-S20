@@ -1,0 +1,73 @@
+diff --git a/drivers/power/hakios.exynos_thermal.c b/drivers/power/hakios.exynos_thermal.c
+index befb469..00943b5 100644
+--- a/drivers/power/hakios.exynos_thermal.c
++++ b/drivers/power/hakios.exynos_thermal.c
+@@ -414,6 +414,7 @@ extern void (*hakios_touch_boost_cpu)(void);
+ 
+ static thread_call_t cpu_gov_call;
+ static volatile uint64_t cpu_gov_until;
++static volatile bool cpu_gov_temp_ok;
+ static uint32_t cpu_gov_a76 = 2392000, cpu_gov_a55 = 2002000, cpu_gov_idle = 1066000, cpu_gov_hot = 50;
+ static uint32_t cpu_gov_now_a76, cpu_gov_now_a55, cpu_gov_changes;
+ 
+@@ -447,7 +448,7 @@ cpu_gov_tick(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
+ 	uint64_t deadline;
+ 	bool hot = exynos_thermal_max_c >= (int)cpu_gov_hot;
+ 
+-	if (mach_absolute_time() < cpu_gov_until) {
++	if (cpu_gov_temp_ok && mach_absolute_time() < cpu_gov_until) {
+ 		cpu_gov_set(hot ? 1794000 : cpu_gov_a76, hot ? 1586000 : cpu_gov_a55, hot ? "touch (hot: capped)" : "touch");
+ 		clock_interval_to_deadline(250, NSEC_PER_MSEC, &deadline);
+ 		thread_call_enter_delayed(cpu_gov_call, deadline);
+@@ -461,6 +462,9 @@ cpu_gov_touch(void)
+ {
+ 	uint64_t hold, was = cpu_gov_until;
+ 
++	if (!cpu_gov_temp_ok) {
++		return;
++	}
+ 	nanoseconds_to_absolutetime(1500 * NSEC_PER_MSEC, &hold);
+ 	cpu_gov_until = mach_absolute_time() + hold;
+ 	if (mach_absolute_time() >= was) {
+@@ -489,9 +493,13 @@ cpu_gov_start(void)
+ 		cpu_gov_hot = v;
+ 	}
+ 	cpu_gov_call = thread_call_allocate_with_priority(cpu_gov_tick, NULL, THREAD_CALL_PRIORITY_HIGH);
++	if (cpu_gov_call == NULL) {
++		say("cpu_gov: no worker available; off\n");
++		return;
++	}
+ 	say("cpu_gov: on: at a touch A76 %u, A55 %u MHz for 1.5 s (capped from %u C), else %u MHz\n", cpu_gov_a76 / 1000,
+ 	    cpu_gov_a55 / 1000, cpu_gov_hot, cpu_gov_idle / 1000);
+-	cpu_gov_set(cpu_gov_idle, cpu_gov_idle, "start");
++	/* Keep the boot clocks until the first touch. The worker handles every rate change. */
+ 	hakios_touch_boost_cpu = cpu_gov_touch;
+ }
+ 
+@@ -568,6 +576,7 @@ look(void)
+ 	exynos_thermal_reads++;
+ 
+ 	if (hottest < 0) {
++		cpu_gov_temp_ok = false;
+ 		blind_ms += (int)poll_ms;
+ 		if (blind_ms >= 10000 && !stopping) {
+ 			stopping = true;
+@@ -591,6 +600,8 @@ look(void)
+ 
+ 	strikes = hottest >= (int)stop_c ? strikes + 1 : 0;
+ 	gpu_strikes = t[3] >= (int)gpu_stop_c ? gpu_strikes + 1 : 0;
++	/* A boost requires valid readings for both clusters it can speed up. */
++	cpu_gov_temp_ok = t[1] >= 0 && t[2] >= 0 && strikes == 0 && gpu_strikes == 0 && !stopping;
+ 	if ((strikes >= 2 || gpu_strikes >= 2) && !stopping) {
+ 		stopping = true;
+ 		if (gpu_strikes >= 2) {
+@@ -757,6 +768,9 @@ exynos_thermal_init(void)
+ 
+ 		clock_interval_to_deadline(60, NSEC_PER_SEC, &deadline);
+ 		thread_call_enter_delayed(thread_call_allocate(cpu_mhz_start, NULL), deadline);
++	} else {
++		/* The touch governor also runs on boots that skip the clock diagnostic. */
++		cpu_gov_start();
+ 	}
+ }
+ STARTUP(EARLY_BOOT, STARTUP_RANK_LAST, exynos_thermal_init);
