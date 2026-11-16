@@ -1,7 +1,7 @@
 # The S20's changes to HakiOS, by area
 
 Each folder is one area of the port, as a patch against HakiOS at the commit in [UPSTREAM_BASE](UPSTREAM_BASE)
-(HakiOS 2.3.4). Apply them in order (01 to 10); together they are every S20 change outside `devices/x1s/`.
+(HakiOS 2.3.4). Apply them in order (01 to 11); together they are every S20 change outside `devices/x1s/`.
 
 ```sh
 for p in ../HakiOS-Galaxy-S20/patches/*/*.patch; do git apply "$p"; done
@@ -27,3 +27,9 @@ The S20's U-Boot (menu, UFS driver, device tree) is not a patch to HakiOS: it is
 ## Mesa retention trial (10)
 
 Adds the MIT-licensed z3sios buffer-cache patch to tools/mesa. Read in the source: 30-second retention with a 64 MiB budget. Not built or measured on this phone yet; keep only after a three-run comparison. See ../CREDITS.md.
+
+## OpenGL shader warm-up trial (11)
+
+With glwarm_lookup=1, link the app transition colour lookup shader while the graphics context starts.
+The default still links on first use. The timing log lets a RAM test check whether the change reduces
+first-open stutter. Source-only trial.
