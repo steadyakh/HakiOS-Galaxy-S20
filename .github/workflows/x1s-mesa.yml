@@ -92,16 +92,18 @@ jobs:
         timeout-minutes: 40
         run: |
           set -o pipefail
-          # The E1 AIR sources are MIT and live in the public repo; nothing of
-          # Apple's or Samsung's is fetched. They are copied into the ephemeral
-          # build tree, patched there, and discarded when the runner ends.
+          # xnu-env puts the cctools (install_name_tool, nm, xnu-clang) on PATH;
+          # mk-mesa.sh made a venv with mako for meson's ninja regenerate. Each
+          # Actions step is a fresh shell, so restore both here.
+          source ./xnu-env.sh
           B=xnu-deps/build/mesa
           MESA=$B/mesa-25.0.7
           BUILD=$B/build-softpipe-panfrost
-          # mk-mesa.sh created a venv with mako for meson; each Actions step is
-          # a fresh shell, so put it back on PATH before ninja regenerates.
           test -x "$B/venv/bin/python3"
           export PATH="$PWD/$B/venv/bin:$PATH"
+          # The E1 AIR sources are MIT and live in the public repo; nothing of
+          # Apple's or Samsung's is fetched. They are copied into the ephemeral
+          # build tree, patched there, and discarded when the runner ends.
           test -d "$MESA/src/compiler/air"     # our GL frontend is present
           test -d "$MESA/src/hakios-drm"       # our DRM shim is present
           rm -rf "$MESA/src/compiler/redwoodair"
@@ -117,7 +119,6 @@ jobs:
           # The plug-in is compiled from the MIT donor sources with the same
           # kernel compiler wrapper and flags E1 uses, with HakiosGPU in place
           # of RedwoodGPU. It dlopens libredwoodair by its install name.
-          source ./xnu-env.sh
           DYN="xnu-clang -arch arm64 -isysroot $THEOS/sdks/iPhoneOS16.5.sdk -O1"
           $DYN -bundle -framework Foundation -framework IOKit -framework Metal -lobjc \
             -o metal-e1-build/RedwoodMetal \
