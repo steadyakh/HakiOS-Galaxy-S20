@@ -8,6 +8,8 @@ on:
       - 'patches/**'
       - '.github/workflows/x1s-mesa.yml'
       - 'tools/package-mesa.py'
+      - 'tools/package-metal.py'
+      - 'metal-e1/**'
       - 'CREDITS.md'
 permissions:
   contents: read
@@ -86,6 +88,46 @@ jobs:
           DRIVERS=softpipe,panfrost tools/mk-mesa.sh 2>&1 | tee logs/mesa-build.log | tail -n 30
           mkdir -p sysimage/rootfs/usr/lib
           GL=1 COMPILE_ONLY=1 userland/build.sh 2>&1 | tee logs/userland-gl-build.log | tail -n 30
+      - name: E1 Metal library and plug-in (AIR=1, source only on GitHub)
+        timeout-minutes: 40
+        run: |
+          set -o pipefail
+          # The E1 AIR sources are MIT and live in the public repo; nothing of
+          # Apple's or Samsung's is fetched. They are copied into the ephemeral
+          # build tree, patched there, and discarded when the runner ends.
+          B=xnu-deps/build/mesa
+          MESA=$B/mesa-25.0.7
+          BUILD=$B/build-softpipe-panfrost
+          test -d "$MESA/src/compiler/air"     # our GL frontend is present
+          test -d "$MESA/src/hakios-drm"       # our DRM shim is present
+          rm -rf "$MESA/src/compiler/redwoodair"
+          cp -r ../port/metal-e1/air "$MESA/src/compiler/redwoodair"
+          patch -s --no-backup-if-mismatch -d "$MESA" -p1 < ../port/metal-e1/meson.patch
+          ninja -C "$BUILD" src/gallium/drivers/panfrost/libredwoodair.dylib 2>&1 | tail -n 20
+          mkdir -p metal-e1-build
+          llvm-strip -x -o metal-e1-build/libredwoodair.dylib \
+            "$BUILD/src/gallium/drivers/panfrost/libredwoodair.dylib"
+          install_name_tool -id /redwood/lib/libredwoodair.dylib metal-e1-build/libredwoodair.dylib
+          echo "libredwoodair.dylib: $(stat -c %s metal-e1-build/libredwoodair.dylib) bytes, " \
+               "$(nm -gU metal-e1-build/libredwoodair.dylib | grep -c ' _rwa_') rwa_* functions"
+          # The plug-in is compiled from the MIT donor sources with the same
+          # kernel compiler wrapper and flags E1 uses, with HakiosGPU in place
+          # of RedwoodGPU. It dlopens libredwoodair by its install name.
+          source ./xnu-env.sh
+          DYN="xnu-clang -arch arm64 -isysroot $THEOS/sdks/iPhoneOS16.5.sdk -O1"
+          $DYN -bundle -framework Foundation -framework IOKit -framework Metal -lobjc \
+            -o metal-e1-build/RedwoodMetal \
+            ../port/metal-e1/userland/redwoodmetal.m ../port/metal-e1/userland/redwooddrawable.m
+          echo "RedwoodMetal: $(stat -c %s metal-e1-build/RedwoodMetal) bytes"
+      - name: Package E1 Metal outputs
+        run: python3 ../port/tools/package-metal.py . ../port ../out-metal-e1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: x1s-metal-e1
+          path: out-metal-e1/
+          retention-days: 14
+          if-no-files-found: error
+
       - name: Package only explicitly listed outputs
         run: python3 ../port/tools/package-mesa.py . ../port ../out-userland-gl
       - uses: actions/upload-artifact@v4

@@ -1,0 +1,60 @@
+Build the vendored E1 (z3sios) AIR compute library for the S20 Mali-G77.
+
+E1's air_metal.c turns the bitcode Metal hands a function into a Gallium compute
+grid through the vendored AIR frontend (src/compiler/redwoodair). The library is
+declared here, in panfrost's directory, because libgallium exists here and not
+where the frontend is read -- the same reason E1's air-panfrost.patch gives.
+
+The libdrm stand-in is OUR shim, tools/mesa/hakios-drm/hakios.drm.c, copied into
+src/hakios-drm by tools/mk-mesa.sh. It speaks the HakiosGPU Panfrost ABI this
+port already uses for GL; E1's redwood-drm (RedwoodGPU / RedwoodMali service names
+and syncobj selectors 0x7b/0x7c) is deliberately not used. air_metal.c only
+needs drmOpenWithType (checked in the source), which our shim provides.
+
+diff --git a/src/compiler/meson.build b/src/compiler/meson.build
+index 63c826b..87c568d 100644
+--- a/src/compiler/meson.build
++++ b/src/compiler/meson.build
+@@ -65,6 +65,8 @@ subdir('spirv')
+ 
+ subdir('air')
+ 
++subdir('redwoodair')
++
+ if with_clc
+   subdir('clc')
+ endif
+diff --git a/src/gallium/drivers/panfrost/meson.build b/src/gallium/drivers/panfrost/meson.build
+index bc66afd..1fc9ff8 100644
+--- a/src/gallium/drivers/panfrost/meson.build
++++ b/src/gallium/drivers/panfrost/meson.build
+@@ -84,3 +84,29 @@ driver_panfrost = declare_dependency(
+   compile_args : compile_args_panfrost,
+   link_with : [libpanfrost, libpanfrostwinsys, libpanfrost_shared, libpanfrost_midgard, libpanfrost_bifrost, libpanfrost_decode, libpanfrost_lib],
+ )
++
++# libredwoodair: the E1 AIR frontend's compute path as a shared library, for
++# the RedwoodMetal plug-in (metal-e1/userland/redwoodmetal.m). Its only contract
++# is metal-e1/air/air_metal.h, which mentions no Mesa headers. Built only when
++# asked; install_name is the path on the device because dlopen uses that path.
++redwoodair_panfrost_drm = []
++if host_machine.system() == 'darwin' and not with_gallium_freedreno
++  redwoodair_panfrost_drm = files('../../../hakios-drm/hakios.drm.c')
++endif
++redwoodair_includes = [inc_include, inc_src, inc_mapi, inc_mesa, inc_gallium,
++                       inc_gallium_aux, inc_gallium_winsys_sw, inc_gallium_winsys,
++                       include_directories('../../drivers')]
++redwoodair_deps = [dep_m, idep_redwoodair, idep_mesautil, idep_xmlconfig,
++                   driver_softpipe, driver_panfrost, dep_libdrm]
++
++libredwoodair = shared_library(
++  'redwoodair',
++  [files('../../../compiler/redwoodair/air_metal.c'), redwoodair_panfrost_drm],
++  include_directories : redwoodair_includes,
++  dependencies : redwoodair_deps,
++  link_with : [libgallium, libgalliumvl_stub, libws_null],
++  link_args : host_machine.system() == 'darwin' ?
++    ['-Wl,-install_name,/redwood/lib/libredwoodair.dylib'] : [],
++  build_by_default : false,
++  install : false,
++)
