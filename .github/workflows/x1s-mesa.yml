@@ -98,6 +98,10 @@ jobs:
           B=xnu-deps/build/mesa
           MESA=$B/mesa-25.0.7
           BUILD=$B/build-softpipe-panfrost
+          # mk-mesa.sh created a venv with mako for meson; each Actions step is
+          # a fresh shell, so put it back on PATH before ninja regenerates.
+          test -x "$B/venv/bin/python3"
+          export PATH="$PWD/$B/venv/bin:$PATH"
           test -d "$MESA/src/compiler/air"     # our GL frontend is present
           test -d "$MESA/src/hakios-drm"       # our DRM shim is present
           rm -rf "$MESA/src/compiler/redwoodair"
