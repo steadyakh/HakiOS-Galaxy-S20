@@ -33,3 +33,9 @@ Adds the MIT-licensed z3sios buffer-cache patch to tools/mesa. Read in the sourc
 With glwarm_lookup=1, link the app transition colour lookup shader while the graphics context starts.
 The default still links on first use. The timing log lets a RAM test check whether the change reduces
 first-open stutter. Source-only trial.
+
+## Metal plug-in switch (12)
+
+`metal=1` keeps the Adreno plug-in; `metal=2` names the RedwoodMetal plug-in for the E1 trial on the
+Mali-G77. The plug-in and its AIR library are built by `.github/workflows/x1s-mesa.yml`; this patch
+only lets the kernel select them. Opt-in, unmeasured on the phone.

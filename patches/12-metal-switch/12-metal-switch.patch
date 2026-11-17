@@ -1,0 +1,28 @@
+metal=2: name the RedwoodMetal plug-in for the E1 trial on the Mali-G77.
+
+metal=1 keeps the current Adreno plug-in. Applied after patches 01-11, which
+do not touch this block; the surrounding code is from upstream HakiOS at
+patches/UPSTREAM_BASE. No Apple or Samsung file is added.
+
+diff --git a/xnu/files/iokit/Kernel/MiniIOMobileFramebuffer.cpp b/xnu/files/iokit/Kernel/MiniIOMobileFramebuffer.cpp
+index 476f505..fb0fd56 100644
+--- a/xnu/files/iokit/Kernel/MiniIOMobileFramebuffer.cpp
++++ b/xnu/files/iokit/Kernel/MiniIOMobileFramebuffer.cpp
+@@ -2145,10 +2145,13 @@ publishAccelerator(IOService * provider)
+ 		 * Never by default: with them a program that asks for Metal gets a device, and CoreAnimation would choose
+ 		 * Metal for the screen; until that device can draw, a screen drawn without it is the working one.
+ 		 */
+-		if (PE_parse_boot_argn("metal", &metal, sizeof(metal)) && metal != 0) {
+-			accelerator->setProperty("MetalPluginName", "HakiosMetal");
+-			accelerator->setProperty("MetalPluginClassName", "HakiosMetalDevice");
+-			IOLog("MiniIOMobileFramebuffer: metal=1: the accelerator names HakiosMetal as its Metal plug-in\n");
++		if (PE_parse_boot_argn("metal", &metal, sizeof(metal)) && (metal == 1 || metal == 2)) {
++			const char * name = metal == 2 ? "RedwoodMetal" : "HakiosMetal";
++			const char * device = metal == 2 ? "RedwoodMetalDevice" : "HakiosMetalDevice";
++
++			accelerator->setProperty("MetalPluginName", name);
++			accelerator->setProperty("MetalPluginClassName", device);
++			IOLog("MiniIOMobileFramebuffer: metal=%u: the accelerator names %s as its Metal plug-in\n", metal, name);
+ 		}
+ 		accelerator->registerService();
+ 	}
