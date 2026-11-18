@@ -1,0 +1,117 @@
+hide_metal=1: keep the window server on OpenGL ES when a Metal device exists.
+
+From E1 (N1709/z3sios, MIT, commit 1323aa51): CoreAnimation takes the Metal road
+as soon as a device exists and asserts on QuartzCore.framework/default.metallib,
+which this image does not carry; the window server crash-loops and nothing is drawn.
+This removes the device from backboardd only, leaving Metal for other processes.
+Opt-in, so default boots are unchanged. Address checked before use.
+
+diff --git a/userland/src/inject.c b/userland/src/inject.c
+index 217e8fa..98b860e 100644
+--- a/userland/src/inject.c
++++ b/userland/src/inject.c
+@@ -502,6 +502,96 @@ my_function_uniform(void *context, unsigned index, size_t components, size_t cou
+ 	orig_function_uniform(context, index, components, count, values);
+ }
+ 
++/*
++ * Keep the window server on OpenGL ES when a Metal plug-in is published.
++ *
++ * From E1 (N1709/z3sios, MIT, commit 1323aa51): with a Metal device present,
++ * CoreAnimation's renderer() goes to CAMetalContextCreate() and then asserts
++ * on QuartzCore.framework/default.metallib, which this image does not carry.
++ * The window server crash-loops and nothing is drawn. Metal keeps its devices
++ * in one static NSMutableArray; MTLCreateSystemDefaultDevice() answers nil
++ * when that array is empty. Removing the device in backboardd alone leaves
++ * Metal working for every other process. Opt-in with hide_metal=1; the
++ * address is checked before it is touched.
++ */
++#define MTL_DEVICE_ARRAY        0x1e1efe9a0UL   /* Metal's static NSMutableArray *_deviceArray */
++#define CA_DETECT_DISPLAYS      0x1884da264UL   /* -[CAWindowServer _detectDisplays] */
++
++extern id objc_retain(id object);
++
++static void (*orig_detect_displays)(id server, SEL selector);
++
++static void
++keep_metal_from_core_animation(void)
++{
++	unsigned long (*ask)(id, SEL) = (unsigned long (*)(id, SEL))objc_msgSend;
++	void (*tell)(id, SEL) = (void (*)(id, SEL))objc_msgSend;
++	id (*create)(void) = (id (*)(void))dlsym(RTLD_DEFAULT, "MTLCreateSystemDefaultDevice");
++	id *slot = (id *)(MTL_DEVICE_ARRAY + slide);
++	id device, array;
++	unsigned long held;
++
++	if (create == NULL) {
++		say("hakios: metal: no MTLCreateSystemDefaultDevice here; nothing to keep\n");
++		return;
++	}
++	if ((device = create()) == NULL) {
++		say("hakios: metal: no device in the window server; CoreAnimation keeps OpenGL ES\n");
++		return;
++	}
++	if ((array = *slot) == NULL) {
++		say("hakios: metal: a device, but nothing at %#lx; the device list is NOT emptied\n",
++		    MTL_DEVICE_ARRAY);
++		return;
++	}
++	if (!((BOOL (*)(id, SEL, Class))objc_msgSend)(array, sel_registerName("isKindOfClass:"),
++	    objc_getClass("NSMutableArray"))) {
++		say("hakios: metal: %#lx holds a %s, not Metal's device array; left alone\n", MTL_DEVICE_ARRAY,
++		    object_getClassName(array));
++		return;
++	}
++	held = ask(array, sel_registerName("count"));
++	objc_retain(device);
++	tell(array, sel_registerName("removeAllObjects"));
++	say("hakios: metal: %s taken out of the window server (%lu in the list, %lu now); "
++	    "MTLCreateSystemDefaultDevice() = %s\n", object_getClassName(device), held,
++	    ask(array, sel_registerName("count")), create() != NULL ? "A DEVICE STILL" : "nil");
++}
++
++static void
++my_detect_displays(id server, SEL selector)
++{
++	static int once;
++
++	if (!once) {
++		once = 1;
++		keep_metal_from_core_animation();
++	}
++	orig_detect_displays(server, selector);
++}
++
++static void
++hide_metal_from_window_server(const char *arguments)
++{
++	Class cls;
++	Method method;
++	IMP original;
++
++	if (strstr(arguments, "hide_metal=1") == NULL) {
++		return;
++	}
++	cls = objc_getClass("CAWindowServer");
++	method = cls ? class_getInstanceMethod(cls, sel_registerName("_detectDisplays")) : NULL;
++	original = method ? method_getImplementation(method) : NULL;
++	if (original == NULL || (uintptr_t)original != CA_DETECT_DISPLAYS + slide) {
++		say("hakios: -[CAWindowServer _detectDisplays]: found %#lx, not %#lx; left alone\n",
++		    original ? (uintptr_t)original - slide : 0, CA_DETECT_DISPLAYS);
++		return;
++	}
++	orig_detect_displays = (void (*)(id, SEL))original;
++	method_setImplementation(method, (IMP)my_detect_displays);
++}
++
+ static void
+ window_server_fixes(void)
+ {
+@@ -1219,6 +1309,7 @@ hakios_init(void)
+ 			watch_metallib_lookups(arguments);
+ 		}
+ 		opengl_es();
++		hide_metal_from_window_server(arguments);
+ 		window_server_fixes();
+ 		/*
+ 		 * brightness_fixes() is not used for now: with it backboardd no longer took our touch

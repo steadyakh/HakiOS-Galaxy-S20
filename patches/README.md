@@ -39,3 +39,10 @@ first-open stutter. Source-only trial.
 `metal=1` keeps the Adreno plug-in; `metal=2` names the RedwoodMetal plug-in for the E1 trial on the
 Mali-G77. The plug-in and its AIR library are built by `.github/workflows/x1s-mesa.yml`; this patch
 only lets the kernel select them. Opt-in, unmeasured on the phone.
+
+## Window server keeps OpenGL ES (13)
+
+With `metal=2` a device exists and CoreAnimation takes the Metal road, where it asserts on
+QuartzCore.framework/default.metallib (absent from this image) and the window server crash-loops.
+`hide_metal=1` removes the device from backboardd alone, so the home screen keeps OpenGL ES and
+Metal stays available to other processes. Adapted from E1 (MIT, credited in CREDITS.md). Opt-in.
