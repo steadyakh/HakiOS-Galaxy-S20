@@ -46,3 +46,9 @@ With `metal=2` a device exists and CoreAnimation takes the Metal road, where it 
 QuartzCore.framework/default.metallib (absent from this image) and the window server crash-loops.
 `hide_metal=1` removes the device from backboardd alone, so the home screen keeps OpenGL ES and
 Metal stays available to other processes. Adapted from E1 (MIT, credited in CREDITS.md). Opt-in.
+
+## MPS no-abort (14)
+
+With , Metal Performance Shaders asserts in SpringBoard when its kernels cannot run on
+this GPU.  makes those kernels return nil instead of aborting. Adapted from E1
+(MIT, credited in CREDITS.md); opt-in.

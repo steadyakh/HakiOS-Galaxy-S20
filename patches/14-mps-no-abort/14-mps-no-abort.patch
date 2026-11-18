@@ -1,0 +1,53 @@
+hide_metal=1: make unsupported Metal Performance Shaders return nil in SpringBoard.
+
+From E1 (N1709/z3sios, MIT, commit 1323aa51): MPS asserts and aborts SpringBoard
+when its kernels cannot run on this GPU. Error mode 4 for failure type 0 makes
+them nil instead. Needed with metal=2 so the home screen survives. Opt-in.
+
+diff --git a/userland/src/inject_sb.c b/userland/src/inject_sb.c
+index f847feb..4ce1111 100644
+--- a/userland/src/inject_sb.c
++++ b/userland/src/inject_sb.c
+@@ -2115,6 +2115,27 @@ caenv(void)
+ 	}
+ }
+ 
++/*
++ * Metal Performance Shaders does not know our GPU: -[MPSKernel initWithDevice:] finds no
++ * MPSDevice and, while MTLReportFailureTypeEnabled(0) holds, MTLReportFailure() aborts
++ * SpringBoard. Error mode 4 for failure type 0 makes MPS return nil instead.
++ * From E1 (N1709/z3sios, MIT, commit 1323aa51). Opt-in with hide_metal=1.
++ */
++static void
++mps_unsupported_returns_nil(void)
++{
++	void *metal = dlopen("/System/Library/Frameworks/Metal.framework/Metal", RTLD_NOW | RTLD_GLOBAL);
++	void (*set_mode)(uint64_t type, uint32_t mode) = metal == NULL ? NULL :
++	    (void (*)(uint64_t, uint32_t))dlsym(metal, "MTLFailureTypeSetErrorModeType");
++
++	if (set_mode == NULL) {
++		say("hakios: SpringBoard: no MTLFailureTypeSetErrorModeType: unsupported MPS still aborts\n");
++		return;
++	}
++	set_mode(0, 4);
++	say("hakios: SpringBoard: MPS failures of type 0 no longer abort\n");
++}
++
+ __attribute__((constructor))
+ static void
+ hakios_springboard_init(void)
+@@ -2127,6 +2148,14 @@ hakios_springboard_init(void)
+ 	if (name == NULL) {
+ 		return;
+ 	}
++	{
++		char args[1024] = "";
++		size_t size = sizeof(args) - 1;
++		if (sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0 &&
++		    strstr(args, "hide_metal=1") != NULL) {
++			mps_unsupported_returns_nil();
++		}
++	}
+ 	if (strcmp(name, "SpringBoard") != 0) {
+ 		static char who[64];
+ 
